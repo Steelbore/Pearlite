@@ -8,7 +8,7 @@ use crate::failure::FailureRef;
 use crate::history::HistoryEntry;
 use crate::io::{FileSystem, LiveFs};
 use crate::reconciliation::ReconciliationEntry;
-use crate::schema::{SCHEMA_VERSION, State};
+use crate::schema::State;
 use std::path::{Path, PathBuf};
 
 /// Read/write coordinator for a `state.toml` at a fixed path.
@@ -58,14 +58,8 @@ impl<F: FileSystem> StateStore<F> {
             }
             Err(e) => return Err(StateError::Io(e)),
         };
-        let state: State = toml::from_str(&content)?;
-        if state.schema_version > SCHEMA_VERSION {
-            return Err(StateError::UnsupportedSchemaVersion {
-                found: state.schema_version,
-                supported: SCHEMA_VERSION,
-            });
-        }
-        Ok(state)
+        let raw: State = toml::from_str(&content)?;
+        crate::migrate::migrate(raw)
     }
 
     /// Atomically write `state` to disk per PRD §7.4: temp + fsync +
@@ -130,6 +124,7 @@ mod tests {
     use super::*;
     use crate::history::SnapshotRef;
     use crate::reconciliation::ReconciliationAction;
+    use crate::schema::SCHEMA_VERSION;
     use std::path::PathBuf;
     use tempfile::TempDir;
     use time::OffsetDateTime;
@@ -314,5 +309,72 @@ mod tests {
         let after = store.read().expect("read");
         assert_eq!(after.reconciliations.len(), 1);
         assert_eq!(after.reconciliations[0], entry);
+    }
+
+    #[test]
+    fn rename_failure_via_mockfs_leaves_old_state() {
+        use crate::mock::MockFs;
+        let fs = MockFs::new();
+        let store = StateStore::with_fs(fs.clone(), PathBuf::from("/var/lib/pearlite/state.toml"));
+
+        let mut state_v1 = empty_state();
+        state_v1.host = "forge-v1".to_owned();
+        store.write_atomic(&state_v1).expect("first write");
+
+        fs.fail_next_rename();
+
+        let mut state_v2 = empty_state();
+        state_v2.host = "forge-v2".to_owned();
+        let err = store.write_atomic(&state_v2);
+        assert!(err.is_err(), "rename failure must propagate as error");
+
+        let read = store.read().expect("read after failed write");
+        assert_eq!(
+            read.host, "forge-v1",
+            "atomic write must leave old content intact on failure"
+        );
+    }
+
+    #[test]
+    fn fsync_dir_failure_via_mockfs_propagates() {
+        use crate::mock::MockFs;
+        let fs = MockFs::new();
+        let store = StateStore::with_fs(fs.clone(), PathBuf::from("/var/lib/pearlite/state.toml"));
+        fs.fail_next_fsync_dir();
+        let err = store.write_atomic(&empty_state());
+        assert!(err.is_err(), "fsync_dir failure must propagate");
+    }
+
+    proptest::proptest! {
+        /// Plan §6.2 acceptance: arbitrary State payload survives a
+        /// write-then-read cycle through the StateStore. Coverage here
+        /// exercises pacman + cargo + adopted lists plus host/tool_version,
+        /// which is the surface most relevant to the engine's hot path.
+        #[test]
+        fn arbitrary_state_payload_round_trips_through_mockfs(
+            host in "[a-z][a-z0-9-]{0,15}",
+            tool_version in "[0-9]+\\.[0-9]+\\.[0-9]+",
+            pacman in proptest::collection::vec("[a-z][a-z0-9-]{0,30}", 0..40),
+            cargo in proptest::collection::vec("[a-z][a-z0-9-]{0,30}", 0..20),
+            adopted_pacman in proptest::collection::vec("[a-z][a-z0-9-]{0,30}", 0..20),
+        ) {
+            use crate::mock::MockFs;
+            let fs = MockFs::new();
+            let store = StateStore::with_fs(fs, PathBuf::from("/state.toml"));
+            let mut state = empty_state();
+            state.host = host.clone();
+            state.tool_version = tool_version.clone();
+            state.managed.pacman = pacman.clone();
+            state.managed.cargo = cargo.clone();
+            state.adopted.pacman = adopted_pacman.clone();
+
+            store.write_atomic(&state).expect("write");
+            let read = store.read().expect("read");
+            proptest::prop_assert_eq!(read.host, host);
+            proptest::prop_assert_eq!(read.tool_version, tool_version);
+            proptest::prop_assert_eq!(read.managed.pacman, pacman);
+            proptest::prop_assert_eq!(read.managed.cargo, cargo);
+            proptest::prop_assert_eq!(read.adopted.pacman, adopted_pacman);
+        }
     }
 }

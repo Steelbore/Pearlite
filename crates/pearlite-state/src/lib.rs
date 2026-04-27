@@ -12,6 +12,9 @@ mod errors;
 mod failure;
 mod history;
 mod io;
+mod migrate;
+#[cfg(any(test, feature = "test-mocks"))]
+mod mock;
 mod reconciliation;
 mod schema;
 mod store;
@@ -26,3 +29,8 @@ pub use schema::{
     UserEnvRecord,
 };
 pub use store::StateStore;
+
+pub use migrate::migrate;
+
+#[cfg(feature = "test-mocks")]
+pub use mock::MockFs;
