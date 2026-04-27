@@ -4,6 +4,16 @@ all-features = true
 [advisories]
 yanked = "deny"
 unmaintained = "workspace"
+# RUSTSEC-2026-0009 — time 0.3.45 has a parse-time stack-exhaustion DoS. The
+# fix in time 0.3.47 raised MSRV to 1.88 which conflicts with our pinned
+# 1.85 (Plan §4.5). Pearlite never feeds untrusted strings to `time::parse`:
+# we only use the crate for serializing/deserializing machine-emitted
+# ISO 8601 in state.toml and plan.json. The DoS surface is therefore not
+# reachable through any Pearlite API.
+#
+# TODO(M1 close): write ADR-008 deciding when to bump MSRV; remove this
+# ignore once MSRV >= 1.88.
+ignore = ["RUSTSEC-2026-0009"]
 
 [licenses]
 allow = [
