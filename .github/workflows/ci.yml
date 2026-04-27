@@ -14,7 +14,9 @@ jobs:
   lint:
     name: T1 — Lint
     runs-on: ubuntu-latest
-    container: ghcr.io/cachyos/cachyos:latest
+    # TODO(M1): switch to a CachyOS container once the image is published to
+    # GHCR or replaced with a custom build. M0 only exercises Rust + POSIX
+    # tooling, so a plain ubuntu-latest runner suffices.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
