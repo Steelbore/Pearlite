@@ -43,13 +43,22 @@ pub enum ApplyError {
     /// systemd adapter failed (enable / disable / mask / restart).
     #[error(transparent)]
     Systemd(#[from] pearlite_systemd::SystemdError),
-    /// `ConfigWrite` action encountered before the phase-4 implementation
-    /// lands. This skeleton apply treats it as a hard error so callers
-    /// don't silently skip declared config writes.
-    #[error("ConfigWrite phase not yet implemented (target: {target})")]
-    ConfigWriteNotYetImplemented {
+    /// Filesystem operation (sha256, atomic write) failed during
+    /// phase-4 `ConfigWrite`.
+    #[error(transparent)]
+    Fs(#[from] pearlite_fs::FsError),
+    /// `ConfigWrite` source file's SHA-256 changed between plan and
+    /// apply. Class 3 recoverable: re-plan and retry.
+    #[error(
+        "config source SHA-256 mismatch for {target}: planned {planned}, found {actual} (re-plan and retry)"
+    )]
+    ContentSha256Mismatch {
         /// Target path the action wanted to write.
         target: std::path::PathBuf,
+        /// SHA-256 the planner recorded.
+        planned: String,
+        /// SHA-256 actually read at apply time.
+        actual: String,
     },
 }
 

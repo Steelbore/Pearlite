@@ -131,7 +131,11 @@ mod tests {
     fn config_write_is_config_writes() {
         let a = Action::ConfigWrite {
             target: PathBuf::from("/etc/sshd_config"),
+            source: PathBuf::from("etc/sshd_config"),
             content_sha256: "abc".to_owned(),
+            mode: 0o644,
+            owner: "root".to_owned(),
+            group: "root".to_owned(),
             declaration_index: 0,
         };
         assert_eq!(a.phase(), ApplyPhase::ConfigWrites);

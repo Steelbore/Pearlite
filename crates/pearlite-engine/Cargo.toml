@@ -45,4 +45,5 @@ pearlite-nickel = { path = "../pearlite-nickel", version = "0.1", features = ["t
 pearlite-pacman = { path = "../pearlite-pacman", version = "0.1", features = ["test-mocks"] }
 pearlite-snapper = { path = "../pearlite-snapper", version = "0.1", features = ["test-mocks"] }
 pearlite-systemd = { path = "../pearlite-systemd", version = "0.1", features = ["test-mocks"] }
+nix = { workspace = true }
 tempfile = { workspace = true }

@@ -138,7 +138,11 @@ mod tests {
     fn config_write_is_recoverable() {
         let a = Action::ConfigWrite {
             target: PathBuf::from("/etc/sshd_config"),
+            source: PathBuf::from("etc/sshd_config"),
             content_sha256: "deadbeef".to_owned(),
+            mode: 0o644,
+            owner: "root".to_owned(),
+            group: "root".to_owned(),
             declaration_index: 0,
         };
         assert_eq!(a.failure_coherence(), FailureCoherence::Recoverable);

@@ -492,6 +492,7 @@ dependencies = [
 name = "pearlite-engine"
 version = "0.1.0"
 dependencies = [
+ "nix",
  "pearlite-cargo",
  "pearlite-diff",
  "pearlite-fs",

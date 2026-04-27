@@ -14,16 +14,14 @@
 //!    within each phase by [`Action::within_phase_key`].
 //! 4. Snapshot post.
 //!
-//! Skeleton scope:
+//! Scope:
 //!
 //! - **In**: snapshot pre/post, db sync, all pacman / cargo / service
-//!   actions, deterministic phase + within-phase ordering.
-//! - **Out** (follow-up PRs): `ConfigWrite` execution, `state.toml`
-//!   commit + history record, post-fail snapshot, rollback.
-//!
-//! `ConfigWrite` actions surface as
-//! [`ApplyError::ConfigWriteNotYetImplemented`] so callers can't
-//! silently skip declared writes.
+//!   actions, `ConfigWrite` (read source, verify SHA-256, atomic write
+//!   via `pearlite_fs::write_etc_atomic`), deterministic phase +
+//!   within-phase ordering.
+//! - **Out** (follow-up PRs): `state.toml` commit + history record,
+//!   post-fail snapshot on Class 3/4, rollback.
 
 use crate::errors::ApplyError;
 use crate::plan::Engine;
@@ -33,6 +31,7 @@ use pearlite_pacman::Pacman;
 use pearlite_snapper::{Snapper, SnapshotInfo};
 use pearlite_systemd::{Scope as SystemdScope, Systemd};
 use std::collections::BTreeMap;
+use std::path::Path;
 use uuid::Uuid;
 
 /// Outcome of a successful [`Engine::apply_plan`] run.
@@ -90,7 +89,7 @@ impl Engine {
         ] {
             if let Some(actions) = buckets.get(&phase) {
                 for action in actions {
-                    exec_action(action, pacman, cargo, systemd)?;
+                    exec_action(action, pacman, cargo, systemd, self.repo_root())?;
                     actions_executed += 1;
                 }
             }
@@ -129,6 +128,7 @@ fn exec_action(
     pacman: &dyn Pacman,
     cargo: &dyn Cargo,
     systemd: &dyn Systemd,
+    repo_root: &Path,
 ) -> Result<(), ApplyError> {
     match action {
         Action::PacmanInstall { repo, packages } => {
@@ -149,10 +149,24 @@ fn exec_action(
         Action::CargoUninstall { crate_name } => {
             cargo.uninstall(crate_name)?;
         }
-        Action::ConfigWrite { target, .. } => {
-            return Err(ApplyError::ConfigWriteNotYetImplemented {
-                target: target.clone(),
-            });
+        Action::ConfigWrite {
+            target,
+            source,
+            content_sha256,
+            mode,
+            owner,
+            group,
+            ..
+        } => {
+            exec_config_write(
+                target,
+                source,
+                content_sha256,
+                *mode,
+                owner,
+                group,
+                repo_root,
+            )?;
         }
         Action::ServiceMask { unit } => {
             systemd.mask(unit)?;
@@ -172,6 +186,52 @@ fn exec_action(
         Action::SnapshotCreate { .. } => {}
     }
     Ok(())
+}
+
+fn exec_config_write(
+    target: &Path,
+    source: &Path,
+    expected_sha256: &str,
+    mode: u32,
+    owner: &str,
+    group: &str,
+    repo_root: &Path,
+) -> Result<(), ApplyError> {
+    let resolved = repo_root.join(source);
+    let content = std::fs::read(&resolved).map_err(|e| {
+        ApplyError::Fs(pearlite_fs::FsError::Io {
+            path: resolved.clone(),
+            source: e,
+        })
+    })?;
+    let actual_digest = pearlite_fs::sha256_bytes(&content);
+    let actual_hex = hex_encode(&actual_digest);
+    if actual_hex != expected_sha256 {
+        return Err(ApplyError::ContentSha256Mismatch {
+            target: target.to_path_buf(),
+            planned: expected_sha256.to_owned(),
+            actual: actual_hex,
+        });
+    }
+    pearlite_fs::write_etc_atomic(target, &content, mode, owner, group)?;
+    Ok(())
+}
+
+fn hex_encode(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push(hex_nibble(b >> 4));
+        s.push(hex_nibble(b & 0x0f));
+    }
+    s
+}
+
+fn hex_nibble(n: u8) -> char {
+    match n {
+        0..=9 => char::from(b'0' + n),
+        10..=15 => char::from(b'a' + n - 10),
+        _ => unreachable!("nibble fits in 4 bits"),
+    }
 }
 
 fn to_systemd_scope(s: &Scope) -> SystemdScope {
@@ -555,18 +615,108 @@ mod tests {
         assert_eq!(out.snapshot_post.id, 2);
     }
 
+    fn current_user_group() -> (String, String) {
+        use nix::unistd::{getgid, getuid};
+        let user = pearlite_fs::name_for_uid(getuid().as_raw());
+        let group = pearlite_fs::name_for_gid(getgid().as_raw());
+        (user, group)
+    }
+
+    fn engine_with_repo_root(repo_root: PathBuf) -> Engine {
+        use pearlite_nickel::MockNickel;
+        use pearlite_schema::{HostInfo, KernelInfo, ProbedState};
+        let probed = ProbedState {
+            probed_at: OffsetDateTime::from_unix_timestamp(1_777_000_000).expect("ts"),
+            host: HostInfo {
+                hostname: "forge".to_owned(),
+            },
+            pacman: None,
+            cargo: None,
+            config_files: None,
+            services: None,
+            kernel: KernelInfo::default(),
+        };
+        Engine::new(
+            Box::new(MockNickel::new()),
+            Box::new(crate::mock_probe::MockProbe::with_state(probed)),
+            repo_root,
+        )
+    }
+
     #[test]
-    fn config_write_returns_not_yet_implemented() {
+    fn config_write_writes_target_atomically() {
+        use tempfile::TempDir;
+
+        let repo = TempDir::new().expect("repo tempdir");
+        let target_dir = TempDir::new().expect("target tempdir");
+
+        let source_rel = PathBuf::from("etc/hello.conf");
+        let source_abs = repo.path().join(&source_rel);
+        std::fs::create_dir_all(source_abs.parent().expect("parent")).expect("mkdir");
+        let content = b"key = value\n";
+        std::fs::write(&source_abs, content).expect("write source");
+        let expected_sha = hex_encode(&pearlite_fs::sha256_bytes(content));
+
+        let target = target_dir.path().join("hello.conf");
+        let (user, group) = current_user_group();
+
         let pacman = MockPacman::new();
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
 
-        let err = engine()
+        engine_with_repo_root(repo.path().to_path_buf())
             .apply_plan(
                 &plan_with_actions(vec![Action::ConfigWrite {
-                    target: PathBuf::from("/etc/sshd_config"),
-                    content_sha256: "deadbeef".to_owned(),
+                    target: target.clone(),
+                    source: source_rel,
+                    content_sha256: expected_sha,
+                    mode: 0o644,
+                    owner: user,
+                    group,
+                    declaration_index: 0,
+                }]),
+                &pacman,
+                &cargo,
+                &systemd,
+                &snapper,
+                "root",
+            )
+            .expect("apply");
+
+        assert_eq!(std::fs::read(&target).expect("read"), content);
+    }
+
+    #[test]
+    fn config_write_sha_mismatch_aborts_apply() {
+        use tempfile::TempDir;
+
+        let repo = TempDir::new().expect("repo tempdir");
+        let target_dir = TempDir::new().expect("target tempdir");
+
+        let source_rel = PathBuf::from("etc/x.conf");
+        let source_abs = repo.path().join(&source_rel);
+        std::fs::create_dir_all(source_abs.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&source_abs, b"actual content\n").expect("write source");
+
+        let target = target_dir.path().join("x.conf");
+        let (user, group) = current_user_group();
+
+        let pacman = MockPacman::new();
+        let cargo = MockCargo::new();
+        let systemd = MockSystemd::new();
+        let snapper = MockSnapper::new();
+
+        let err = engine_with_repo_root(repo.path().to_path_buf())
+            .apply_plan(
+                &plan_with_actions(vec![Action::ConfigWrite {
+                    target: target.clone(),
+                    source: source_rel,
+                    // Deliberately wrong SHA-256.
+                    content_sha256: "0".repeat(64),
+                    mode: 0o644,
+                    owner: user,
+                    group,
                     declaration_index: 0,
                 }]),
                 &pacman,
@@ -577,9 +727,46 @@ mod tests {
             )
             .expect_err("must fail");
         assert!(
-            matches!(err, ApplyError::ConfigWriteNotYetImplemented { .. }),
+            matches!(err, ApplyError::ContentSha256Mismatch { .. }),
             "got {err:?}"
         );
+        assert!(!target.exists(), "target must not be created on mismatch");
+    }
+
+    #[test]
+    fn config_write_missing_source_yields_fs_error() {
+        use tempfile::TempDir;
+
+        let repo = TempDir::new().expect("repo tempdir");
+        let target_dir = TempDir::new().expect("target tempdir");
+
+        let target = target_dir.path().join("missing.conf");
+        let (user, group) = current_user_group();
+
+        let pacman = MockPacman::new();
+        let cargo = MockCargo::new();
+        let systemd = MockSystemd::new();
+        let snapper = MockSnapper::new();
+
+        let err = engine_with_repo_root(repo.path().to_path_buf())
+            .apply_plan(
+                &plan_with_actions(vec![Action::ConfigWrite {
+                    target,
+                    source: PathBuf::from("etc/does-not-exist.conf"),
+                    content_sha256: "0".repeat(64),
+                    mode: 0o644,
+                    owner: user,
+                    group,
+                    declaration_index: 0,
+                }]),
+                &pacman,
+                &cargo,
+                &systemd,
+                &snapper,
+                "root",
+            )
+            .expect_err("must fail");
+        assert!(matches!(err, ApplyError::Fs(_)), "got {err:?}");
     }
 
     #[test]
