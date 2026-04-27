@@ -32,6 +32,8 @@ pearlite-snapper = { path = "../pearlite-snapper", version = "0.1" }
 pearlite-state = { path = "../pearlite-state", version = "0.1" }
 pearlite-systemd = { path = "../pearlite-systemd", version = "0.1" }
 rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }

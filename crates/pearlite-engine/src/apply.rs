@@ -19,24 +19,56 @@
 //! - **In**: snapshot pre/post, db sync, all pacman / cargo / service
 //!   actions, `ConfigWrite` (read source, verify SHA-256, atomic write
 //!   via `pearlite_fs::write_etc_atomic`), `state.toml` history-entry
-//!   commit (PRD §8.2 phase 9 — last write), deterministic phase +
-//!   within-phase ordering.
-//! - **Out** (follow-up PRs): post-fail snapshot on Class 3/4, failure
-//!   record writing, rollback.
+//!   commit (PRD §8.2 phase 9 — last write), failure path (post-fail
+//!   snapshot, `FailureRecord` JSON write, `[[failures]]` append),
+//!   deterministic phase + within-phase ordering.
+//! - **Out** (follow-up PRs): `Engine::rollback`.
 
 use crate::errors::ApplyError;
 use crate::plan::Engine;
 use pearlite_cargo::Cargo;
-use pearlite_diff::{Action, ApplyPhase, Plan, Scope};
+use pearlite_diff::{Action, ApplyPhase, FailureCoherence, Plan, Scope};
 use pearlite_pacman::Pacman;
 use pearlite_snapper::{Snapper, SnapshotInfo};
-use pearlite_state::{HistoryEntry, SnapshotRef, StateStore};
+use pearlite_state::{FailureRef, HistoryEntry, SnapshotRef, StateStore};
 use pearlite_systemd::{Scope as SystemdScope, Systemd};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+/// Forensic record written to `<failures_dir>/<plan-id>.json` when an
+/// apply halts mid-pipeline. The full record is what the user reads
+/// during a post-mortem; [`FailureRef`] in `state.toml` is just the
+/// pointer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FailureRecord {
+    /// Plan UUID this failure pertains to.
+    pub plan_id: Uuid,
+    /// UTC timestamp the failure was detected.
+    #[serde(with = "time::serde::iso8601")]
+    pub failed_at: OffsetDateTime,
+    /// PRD §8.5 failure class: 3 recoverable, 4 incoherent.
+    pub class: u8,
+    /// Process exit code corresponding to the class (4 or 5).
+    pub exit_code: u8,
+    /// Action that errored.
+    pub failed_action: Action,
+    /// Index of the failed action in the plan's `actions` vec
+    /// (post-stable-sort by `within_phase_key` within each phase).
+    pub failed_action_executed_index: usize,
+    /// `Display` form of the underlying [`ApplyError`].
+    pub error_message: String,
+    /// Post-failure forensic snapshot, if Snapper accepted it.
+    /// `None` when the post-fail snapshot itself failed (Snapper
+    /// disk full, btrfs read-only, etc.).
+    pub post_fail_snapshot: Option<SnapshotRef>,
+    /// Pre-apply snapshot (mirror of the entry the user would
+    /// `pearlite rollback` to).
+    pub snapshot_pre: SnapshotRef,
+}
 
 /// Outcome of a successful [`Engine::apply_plan`] run.
 #[derive(Clone, Debug)]
@@ -69,17 +101,25 @@ impl Engine {
     /// `snapper_config` is the snapper config name to take snapshots
     /// against (typically `"root"`). `state_path` is the absolute path
     /// to `state.toml`; it must already exist (initial creation is
-    /// `pearlite init`).
+    /// `pearlite init`). `failures_dir` is the directory where failure
+    /// JSON records land — created if missing.
     ///
     /// # Errors
     /// Returns [`ApplyError`] wrapping the failing adapter's error.
     /// The CLI boundary maps this to a failure class via
     /// [`Action::failure_coherence`] on the failed action.
+    ///
+    /// On mid-pipeline failure (an `Action` errored), the engine takes
+    /// a best-effort post-fail Snapper snapshot, writes a
+    /// [`FailureRecord`] JSON to `<failures_dir>/<plan-id>.json`, and
+    /// appends a [`FailureRef`] to `state.toml`. These side effects
+    /// are best-effort: a record-writing failure does not mask the
+    /// underlying [`ApplyError`].
     #[allow(
         clippy::too_many_arguments,
         reason = "apply_plan is the orchestrator entry point; passing all four \
-                  trait-object adapters + plan + state path is the natural surface, \
-                  and a builder hides too much of what's load-bearing"
+                  trait-object adapters + plan + state path + failures dir is the \
+                  natural surface, and a builder hides too much of what's load-bearing"
     )]
     pub fn apply_plan(
         &self,
@@ -90,6 +130,7 @@ impl Engine {
         snapper: &dyn Snapper,
         snapper_config: &str,
         state_path: &Path,
+        failures_dir: &Path,
     ) -> Result<ApplyOutcome, ApplyError> {
         let started = Instant::now();
 
@@ -102,7 +143,8 @@ impl Engine {
         }
 
         let mut actions_executed = 0usize;
-        for phase in [
+        let mut failure: Option<(usize, Action, ApplyError)> = None;
+        'phases: for phase in [
             ApplyPhase::Removals,
             ApplyPhase::Installs,
             ApplyPhase::ConfigWrites,
@@ -111,10 +153,28 @@ impl Engine {
         ] {
             if let Some(actions) = buckets.get(&phase) {
                 for action in actions {
-                    exec_action(action, pacman, cargo, systemd, self.repo_root())?;
+                    if let Err(e) = exec_action(action, pacman, cargo, systemd, self.repo_root()) {
+                        failure = Some((actions_executed, (*action).clone(), e));
+                        break 'phases;
+                    }
                     actions_executed += 1;
                 }
             }
+        }
+
+        if let Some((idx, failed_action, err)) = failure {
+            record_apply_failure(
+                plan,
+                idx,
+                failed_action,
+                &err,
+                snapper,
+                snapper_config,
+                &snapshot_pre,
+                state_path,
+                failures_dir,
+            );
+            return Err(err);
         }
 
         let snapshot_post = snapper.create(snapper_config, &post_label(plan.plan_id))?;
@@ -152,6 +212,78 @@ impl Engine {
             duration_ms,
         })
     }
+}
+
+/// Forensic-record bookkeeping for a mid-pipeline apply failure.
+///
+/// Steps, each best-effort and independent so a later failure
+/// doesn't mask the underlying error:
+///
+/// 1. Take a post-fail Snapper snapshot.
+/// 2. Build a [`FailureRecord`] from what we know.
+/// 3. Serialize it to `<failures_dir>/<plan-id>.json`.
+/// 4. Append a [`FailureRef`] to `state.toml`.
+///
+/// Errors are intentionally swallowed: the apply has already failed,
+/// and a failed-record-write (or stale state.toml) is a secondary
+/// concern. The caller still sees the original [`ApplyError`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "record_apply_failure mirrors apply_plan's parameter set; \
+              the fields are all load-bearing for the forensic record"
+)]
+fn record_apply_failure(
+    plan: &Plan,
+    executed_index: usize,
+    failed_action: Action,
+    err: &ApplyError,
+    snapper: &dyn Snapper,
+    snapper_config: &str,
+    snapshot_pre: &SnapshotInfo,
+    state_path: &Path,
+    failures_dir: &Path,
+) {
+    let class = match failed_action.failure_coherence() {
+        FailureCoherence::Recoverable => 3u8,
+        FailureCoherence::Incoherent => 4u8,
+    };
+    let exit_code = if class == 3 { 4u8 } else { 5u8 };
+
+    let post_fail_snapshot = snapper
+        .create(snapper_config, &post_fail_label(plan.plan_id))
+        .ok();
+
+    let record = FailureRecord {
+        plan_id: plan.plan_id,
+        failed_at: OffsetDateTime::now_utc(),
+        class,
+        exit_code,
+        failed_action,
+        failed_action_executed_index: executed_index,
+        error_message: err.to_string(),
+        post_fail_snapshot: post_fail_snapshot.as_ref().map(to_snapshot_ref),
+        snapshot_pre: to_snapshot_ref(snapshot_pre),
+    };
+
+    let record_path = failures_dir.join(format!("{}.json", plan.plan_id.simple()));
+    let _ = std::fs::create_dir_all(failures_dir);
+    if let Ok(json) = serde_json::to_vec_pretty(&record) {
+        let _ = std::fs::write(&record_path, &json);
+    }
+
+    let failure_ref = FailureRef {
+        plan_id: plan.plan_id,
+        failed_at: record.failed_at,
+        class,
+        exit_code,
+        record_path,
+    };
+    let store = StateStore::new(state_path.to_path_buf());
+    let _ = store.append_failure(failure_ref);
+}
+
+fn post_fail_label(plan_id: Uuid) -> String {
+    format!("post-fail-pearlite-apply-{}", short_id(plan_id))
 }
 
 fn next_generation(state: &pearlite_state::State) -> u64 {
@@ -402,9 +534,11 @@ mod tests {
     }
 
     /// Create a `state.toml` in `dir` pre-populated with a minimal,
-    /// schema-valid baseline. Returns its absolute path.
-    fn setup_state(dir: &TempDir) -> PathBuf {
+    /// schema-valid baseline, plus an adjacent `failures/` directory.
+    /// Returns `(state_path, failures_dir)`.
+    fn setup_state(dir: &TempDir) -> (PathBuf, PathBuf) {
         let path = dir.path().join("state.toml");
+        let failures = dir.path().join("failures");
         let store = StateStore::new(path.clone());
         let state = pearlite_state::State {
             schema_version: SCHEMA_VERSION,
@@ -421,7 +555,7 @@ mod tests {
             reserved: BTreeMap::new(),
         };
         store.write_atomic(&state).expect("write base state");
-        path
+        (path, failures)
     }
 
     #[test]
@@ -431,7 +565,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let state_dir = TempDir::new().expect("state tempdir");
-        let state_path = setup_state(&state_dir);
+        let (state_path, failures_dir) = setup_state(&state_dir);
 
         let out = engine()
             .apply_plan(
@@ -442,6 +576,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect("apply");
 
@@ -470,7 +605,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let state_dir = TempDir::new().expect("state tempdir");
-        let state_path = setup_state(&state_dir);
+        let (state_path, failures_dir) = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -484,6 +619,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect("apply");
         assert_eq!(pacman.sync_count(), 0, "cargo-only plan must not sync");
@@ -500,6 +636,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect("apply");
         assert_eq!(pacman.sync_count(), 1, "pacman install triggers sync");
@@ -518,7 +655,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let state_dir = TempDir::new().expect("state tempdir");
-        let state_path = setup_state(&state_dir);
+        let (state_path, failures_dir) = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -532,6 +669,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect("apply");
         assert_eq!(
@@ -550,7 +688,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let state_dir = TempDir::new().expect("state tempdir");
-        let state_path = setup_state(&state_dir);
+        let (state_path, failures_dir) = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -563,6 +701,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect("apply");
         assert_eq!(pacman.aur_install_history(), vec![vec!["yay".to_owned()]]);
@@ -576,7 +715,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let state_dir = TempDir::new().expect("state tempdir");
-        let state_path = setup_state(&state_dir);
+        let (state_path, failures_dir) = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -595,6 +734,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect("apply");
         assert_eq!(cargo.uninstall_history(), vec!["old-crate".to_owned()]);
@@ -608,7 +748,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let state_dir = TempDir::new().expect("state tempdir");
-        let state_path = setup_state(&state_dir);
+        let (state_path, failures_dir) = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -630,6 +770,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect("apply");
         assert_eq!(
@@ -647,7 +788,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let state_dir = TempDir::new().expect("state tempdir");
-        let state_path = setup_state(&state_dir);
+        let (state_path, failures_dir) = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -663,6 +804,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect("apply");
         assert_eq!(
@@ -685,7 +827,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let state_dir = TempDir::new().expect("state tempdir");
-        let state_path = setup_state(&state_dir);
+        let (state_path, failures_dir) = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -708,6 +850,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect("apply");
 
@@ -724,7 +867,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let state_dir = TempDir::new().expect("state tempdir");
-        let state_path = setup_state(&state_dir);
+        let (state_path, failures_dir) = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -747,6 +890,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect("apply");
 
@@ -762,7 +906,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let state_dir = TempDir::new().expect("state tempdir");
-        let state_path = setup_state(&state_dir);
+        let (state_path, failures_dir) = setup_state(&state_dir);
 
         let out = engine()
             .apply_plan(
@@ -776,6 +920,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect("apply");
         assert_eq!(out.snapshot_pre.id, 1);
@@ -815,7 +960,7 @@ mod tests {
         let repo = TempDir::new().expect("repo tempdir");
         let target_dir = TempDir::new().expect("target tempdir");
         let state_dir = TempDir::new().expect("state tempdir");
-        let state_path = setup_state(&state_dir);
+        let (state_path, failures_dir) = setup_state(&state_dir);
 
         let source_rel = PathBuf::from("etc/hello.conf");
         let source_abs = repo.path().join(&source_rel);
@@ -849,6 +994,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect("apply");
 
@@ -860,7 +1006,7 @@ mod tests {
         let repo = TempDir::new().expect("repo tempdir");
         let target_dir = TempDir::new().expect("target tempdir");
         let state_dir = TempDir::new().expect("state tempdir");
-        let state_path = setup_state(&state_dir);
+        let (state_path, failures_dir) = setup_state(&state_dir);
 
         let source_rel = PathBuf::from("etc/x.conf");
         let source_abs = repo.path().join(&source_rel);
@@ -893,6 +1039,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect_err("must fail");
         assert!(
@@ -914,7 +1061,7 @@ mod tests {
         let repo = TempDir::new().expect("repo tempdir");
         let target_dir = TempDir::new().expect("target tempdir");
         let state_dir = TempDir::new().expect("state tempdir");
-        let state_path = setup_state(&state_dir);
+        let (state_path, failures_dir) = setup_state(&state_dir);
 
         let target = target_dir.path().join("missing.conf");
         let (user, group) = current_user_group();
@@ -941,6 +1088,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect_err("must fail");
         assert!(matches!(err, ApplyError::Fs(_)), "got {err:?}");
@@ -976,7 +1124,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let state_dir = TempDir::new().expect("state tempdir");
-        let state_path = setup_state(&state_dir);
+        let (state_path, failures_dir) = setup_state(&state_dir);
 
         let err = engine()
             .apply_plan(
@@ -987,6 +1135,7 @@ mod tests {
                 &FailingSnapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect_err("must fail");
         assert!(matches!(err, ApplyError::Snapper(_)), "got {err:?}");
@@ -1002,6 +1151,7 @@ mod tests {
         // Don't write a base state — apply_plan must error rather than
         // silently creating one.
         let state_path = state_dir.path().join("state.toml");
+        let failures_dir = state_dir.path().join("failures");
 
         let err = engine()
             .apply_plan(
@@ -1012,6 +1162,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect_err("must fail");
         assert!(matches!(err, ApplyError::State(_)), "got {err:?}");
@@ -1024,7 +1175,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let state_dir = TempDir::new().expect("state tempdir");
-        let state_path = setup_state(&state_dir);
+        let (state_path, failures_dir) = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -1047,6 +1198,7 @@ mod tests {
                 &snapper,
                 "root",
                 &state_path,
+                &failures_dir,
             )
             .expect("apply");
 
@@ -1063,6 +1215,145 @@ mod tests {
         assert!(
             summary.contains("1 service-state"),
             "summary must show service-state count: {summary}"
+        );
+    }
+
+    #[test]
+    fn config_write_failure_records_class_3_failure_ref() {
+        let repo = TempDir::new().expect("repo tempdir");
+        let target_dir = TempDir::new().expect("target tempdir");
+        let state_dir = TempDir::new().expect("state tempdir");
+        let (state_path, failures_dir) = setup_state(&state_dir);
+
+        let source_rel = PathBuf::from("etc/x.conf");
+        let source_abs = repo.path().join(&source_rel);
+        std::fs::create_dir_all(source_abs.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&source_abs, b"actual content\n").expect("write source");
+
+        let target = target_dir.path().join("x.conf");
+        let (user, group) = current_user_group();
+
+        let pacman = MockPacman::new();
+        let cargo = MockCargo::new();
+        let systemd = MockSystemd::new();
+        let snapper = MockSnapper::new();
+
+        let _ = engine_with_repo_root(repo.path().to_path_buf())
+            .apply_plan(
+                &plan_with_actions(vec![Action::ConfigWrite {
+                    target,
+                    source: source_rel,
+                    content_sha256: "0".repeat(64),
+                    mode: 0o644,
+                    owner: user,
+                    group,
+                    declaration_index: 0,
+                }]),
+                &pacman,
+                &cargo,
+                &systemd,
+                &snapper,
+                "root",
+                &state_path,
+                &failures_dir,
+            )
+            .expect_err("must fail");
+
+        // FailureRef appended with class 3 (Recoverable) / exit 4.
+        let read_back = StateStore::new(state_path).read().expect("read state");
+        assert_eq!(read_back.failures.len(), 1);
+        assert_eq!(read_back.failures[0].class, 3);
+        assert_eq!(read_back.failures[0].exit_code, 4);
+
+        // Forensic JSON record was written.
+        let record_path = &read_back.failures[0].record_path;
+        assert!(record_path.exists(), "failure JSON must be written");
+        let raw = std::fs::read(record_path).expect("read record");
+        let record: FailureRecord = serde_json::from_slice(&raw).expect("parse record");
+        assert_eq!(record.class, 3);
+        assert_eq!(record.exit_code, 4);
+        assert!(matches!(record.failed_action, Action::ConfigWrite { .. }));
+    }
+
+    #[test]
+    fn service_restart_failure_is_class_4_incoherent() {
+        struct FailingRestart;
+        impl Systemd for FailingRestart {
+            fn inventory(
+                &self,
+            ) -> Result<pearlite_schema::ServiceInventory, pearlite_systemd::SystemdError>
+            {
+                Ok(pearlite_schema::ServiceInventory::default())
+            }
+            fn enable(
+                &self,
+                _: &str,
+                _: &SystemdScope,
+            ) -> Result<(), pearlite_systemd::SystemdError> {
+                Ok(())
+            }
+            fn disable(
+                &self,
+                _: &str,
+                _: &SystemdScope,
+            ) -> Result<(), pearlite_systemd::SystemdError> {
+                Ok(())
+            }
+            fn mask(&self, _: &str) -> Result<(), pearlite_systemd::SystemdError> {
+                Ok(())
+            }
+            fn restart(&self, _: &str) -> Result<(), pearlite_systemd::SystemdError> {
+                Err(pearlite_systemd::SystemdError::NotInPath { hint: "test" })
+            }
+        }
+
+        let pacman = MockPacman::new();
+        let cargo = MockCargo::new();
+        let snapper = MockSnapper::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let (state_path, failures_dir) = setup_state(&state_dir);
+
+        let err = engine()
+            .apply_plan(
+                &plan_with_actions(vec![Action::ServiceRestart {
+                    unit: "sshd.service".to_owned(),
+                }]),
+                &pacman,
+                &cargo,
+                &FailingRestart,
+                &snapper,
+                "root",
+                &state_path,
+                &failures_dir,
+            )
+            .expect_err("must fail");
+        assert!(matches!(err, ApplyError::Systemd(_)), "got {err:?}");
+
+        // ServiceRestart is the only Incoherent variant: class 4 / exit 5.
+        let read_back = StateStore::new(state_path).read().expect("read state");
+        assert!(read_back.history.is_empty(), "no history on failure");
+        assert_eq!(read_back.failures.len(), 1);
+        assert_eq!(read_back.failures[0].class, 4);
+        assert_eq!(read_back.failures[0].exit_code, 5);
+
+        // Best-effort post-fail snapshot was taken: total snapshots
+        // = pre (1) + post-fail (1) = 2.
+        assert_eq!(snapper.list("root").expect("list").len(), 2);
+        let labels: Vec<String> = snapper
+            .list("root")
+            .expect("list")
+            .into_iter()
+            .map(|s| s.label)
+            .collect();
+        assert!(
+            labels.iter().any(|l| l.starts_with("pre-pearlite-apply-")),
+            "pre snapshot labelled, got {labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.starts_with("post-fail-pearlite-apply-")),
+            "post-fail snapshot labelled, got {labels:?}"
         );
     }
 }

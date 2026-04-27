@@ -503,6 +503,8 @@ dependencies = [
  "pearlite-state",
  "pearlite-systemd",
  "rayon",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "time",
