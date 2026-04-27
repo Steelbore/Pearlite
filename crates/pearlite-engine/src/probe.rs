@@ -163,6 +163,22 @@ mod tests {
                     hint: "test",
                 })
             }
+            fn sync_databases(&self) -> Result<(), pearlite_pacman::PacmanError> {
+                Ok(())
+            }
+            fn install(
+                &self,
+                _repo: &str,
+                _packages: &[&str],
+            ) -> Result<(), pearlite_pacman::PacmanError> {
+                Ok(())
+            }
+            fn aur_install(&self, _packages: &[&str]) -> Result<(), pearlite_pacman::PacmanError> {
+                Ok(())
+            }
+            fn remove(&self, _packages: &[&str]) -> Result<(), pearlite_pacman::PacmanError> {
+                Ok(())
+            }
         }
 
         let probe = LiveProbe::new(
