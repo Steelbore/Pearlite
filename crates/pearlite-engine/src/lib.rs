@@ -12,7 +12,7 @@ mod errors;
 mod plan;
 mod probe;
 
-pub use apply::ApplyOutcome;
+pub use apply::{ApplyOutcome, FailureRecord};
 pub use errors::{ApplyError, EngineError, ProbeError};
 pub use plan::Engine;
 pub use probe::{LiveProbe, SystemProbe};
