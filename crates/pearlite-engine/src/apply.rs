@@ -18,10 +18,11 @@
 //!
 //! - **In**: snapshot pre/post, db sync, all pacman / cargo / service
 //!   actions, `ConfigWrite` (read source, verify SHA-256, atomic write
-//!   via `pearlite_fs::write_etc_atomic`), deterministic phase +
+//!   via `pearlite_fs::write_etc_atomic`), `state.toml` history-entry
+//!   commit (PRD §8.2 phase 9 — last write), deterministic phase +
 //!   within-phase ordering.
-//! - **Out** (follow-up PRs): `state.toml` commit + history record,
-//!   post-fail snapshot on Class 3/4, rollback.
+//! - **Out** (follow-up PRs): post-fail snapshot on Class 3/4, failure
+//!   record writing, rollback.
 
 use crate::errors::ApplyError;
 use crate::plan::Engine;
@@ -29,9 +30,12 @@ use pearlite_cargo::Cargo;
 use pearlite_diff::{Action, ApplyPhase, Plan, Scope};
 use pearlite_pacman::Pacman;
 use pearlite_snapper::{Snapper, SnapshotInfo};
+use pearlite_state::{HistoryEntry, SnapshotRef, StateStore};
 use pearlite_systemd::{Scope as SystemdScope, Systemd};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Instant;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 /// Outcome of a successful [`Engine::apply_plan`] run.
@@ -46,22 +50,37 @@ pub struct ApplyOutcome {
     /// Number of plan actions actually executed (excludes
     /// `SnapshotCreate` history records, which are not orchestrated).
     pub actions_executed: usize,
+    /// Generation number assigned to the new history entry (max of
+    /// previous generations + 1, or 1 for the first apply).
+    pub generation: u64,
+    /// Wall-clock duration of the apply, in milliseconds.
+    pub duration_ms: u64,
 }
 
 impl Engine {
     /// Execute a [`Plan`] against the live system.
     ///
-    /// Wraps the apply in pre/post Snapper snapshots and dispatches
-    /// every `Action` to the appropriate adapter in PRD §8.2 phase
-    /// order. Halts on the first error.
+    /// Wraps the apply in pre/post Snapper snapshots, dispatches every
+    /// `Action` to the appropriate adapter in PRD §8.2 phase order,
+    /// then commits a [`HistoryEntry`] to `state.toml` (phase 9 — the
+    /// last write per CLAUDE.md hard invariant 8). Halts on the first
+    /// error.
     ///
     /// `snapper_config` is the snapper config name to take snapshots
-    /// against (typically `"root"`).
+    /// against (typically `"root"`). `state_path` is the absolute path
+    /// to `state.toml`; it must already exist (initial creation is
+    /// `pearlite init`).
     ///
     /// # Errors
     /// Returns [`ApplyError`] wrapping the failing adapter's error.
     /// The CLI boundary maps this to a failure class via
     /// [`Action::failure_coherence`] on the failed action.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "apply_plan is the orchestrator entry point; passing all four \
+                  trait-object adapters + plan + state path is the natural surface, \
+                  and a builder hides too much of what's load-bearing"
+    )]
     pub fn apply_plan(
         &self,
         plan: &Plan,
@@ -70,7 +89,10 @@ impl Engine {
         systemd: &dyn Systemd,
         snapper: &dyn Snapper,
         snapper_config: &str,
+        state_path: &Path,
     ) -> Result<ApplyOutcome, ApplyError> {
+        let started = Instant::now();
+
         let snapshot_pre = snapper.create(snapper_config, &pre_label(plan.plan_id))?;
 
         let buckets = partition_by_phase(&plan.actions);
@@ -97,13 +119,86 @@ impl Engine {
 
         let snapshot_post = snapper.create(snapper_config, &post_label(plan.plan_id))?;
 
+        // Phase 9 — state.toml commit. PRD §8.2 invariant 8: this is
+        // the last file written on apply.
+        let store = StateStore::new(state_path.to_path_buf());
+        let mut state = store.read()?;
+        let generation = next_generation(&state);
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let summary = summarize(&plan.actions);
+        let entry = HistoryEntry {
+            plan_id: plan.plan_id,
+            generation,
+            applied_at: OffsetDateTime::now_utc(),
+            duration_ms,
+            snapshot_pre: to_snapshot_ref(&snapshot_pre),
+            snapshot_post: to_snapshot_ref(&snapshot_post),
+            actions_executed: u32::try_from(actions_executed).unwrap_or(u32::MAX),
+            git_revision: None,
+            git_dirty: false,
+            summary,
+        };
+        state.history.push(entry);
+        state.last_apply = Some(OffsetDateTime::now_utc());
+        state.last_modified = state.last_apply;
+        store.write_atomic(&state)?;
+
         Ok(ApplyOutcome {
             plan_id: plan.plan_id,
             snapshot_pre,
             snapshot_post,
             actions_executed,
+            generation,
+            duration_ms,
         })
     }
+}
+
+fn next_generation(state: &pearlite_state::State) -> u64 {
+    state
+        .history
+        .iter()
+        .map(|h| h.generation)
+        .max()
+        .map_or(1, |m| m + 1)
+}
+
+fn to_snapshot_ref(s: &SnapshotInfo) -> SnapshotRef {
+    SnapshotRef {
+        id: s.id,
+        label: s.label.clone(),
+        created_at: s.created_at,
+    }
+}
+
+fn summarize(actions: &[Action]) -> String {
+    let mut installs = 0u32;
+    let mut removals = 0u32;
+    let mut config_writes = 0u32;
+    let mut service_state = 0u32;
+    let mut restarts = 0u32;
+    for a in actions {
+        match a {
+            Action::PacmanInstall { packages, .. } | Action::AurInstall { packages } => {
+                installs += u32::try_from(packages.len()).unwrap_or(u32::MAX);
+            }
+            Action::CargoInstall { .. } => installs += 1,
+            Action::PacmanRemove { packages } => {
+                removals += u32::try_from(packages.len()).unwrap_or(u32::MAX);
+            }
+            Action::CargoUninstall { .. } => removals += 1,
+            Action::ConfigWrite { .. } => config_writes += 1,
+            Action::ServiceMask { .. }
+            | Action::ServiceDisable { .. }
+            | Action::ServiceEnable { .. } => service_state += 1,
+            Action::ServiceRestart { .. } => restarts += 1,
+            Action::SnapshotCreate { .. } => {}
+        }
+    }
+    format!(
+        "+{installs} -{removals} ~{config_writes} ({installs} installs, {removals} removals, \
+         {config_writes} config updates, {service_state} service-state changes, {restarts} restarts)"
+    )
 }
 
 fn partition_by_phase(actions: &[Action]) -> BTreeMap<ApplyPhase, Vec<&Action>> {
@@ -267,8 +362,10 @@ mod tests {
     use pearlite_diff::{Phase, Plan as DiffPlan};
     use pearlite_pacman::MockPacman;
     use pearlite_snapper::MockSnapper;
+    use pearlite_state::SCHEMA_VERSION;
     use pearlite_systemd::MockSystemd;
     use std::path::PathBuf;
+    use tempfile::TempDir;
     use time::OffsetDateTime;
 
     fn engine() -> Engine {
@@ -304,12 +401,37 @@ mod tests {
         }
     }
 
+    /// Create a `state.toml` in `dir` pre-populated with a minimal,
+    /// schema-valid baseline. Returns its absolute path.
+    fn setup_state(dir: &TempDir) -> PathBuf {
+        let path = dir.path().join("state.toml");
+        let store = StateStore::new(path.clone());
+        let state = pearlite_state::State {
+            schema_version: SCHEMA_VERSION,
+            host: "forge".to_owned(),
+            tool_version: "0.1.0".to_owned(),
+            config_dir: PathBuf::from("/cfg"),
+            last_apply: None,
+            last_modified: None,
+            managed: pearlite_state::Managed::default(),
+            adopted: pearlite_state::Adopted::default(),
+            history: Vec::new(),
+            reconciliations: Vec::new(),
+            failures: Vec::new(),
+            reserved: BTreeMap::new(),
+        };
+        store.write_atomic(&state).expect("write base state");
+        path
+    }
+
     #[test]
     fn empty_plan_takes_pre_and_post_snapshots() {
         let pacman = MockPacman::new();
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let state_path = setup_state(&state_dir);
 
         let out = engine()
             .apply_plan(
@@ -319,6 +441,7 @@ mod tests {
                 &systemd,
                 &snapper,
                 "root",
+                &state_path,
             )
             .expect("apply");
 
@@ -328,6 +451,16 @@ mod tests {
         assert!(out.snapshot_pre.label.starts_with("pre-pearlite-apply-"));
         assert!(out.snapshot_post.label.starts_with("post-pearlite-apply-"));
         assert_eq!(pacman.sync_count(), 0, "no installs → no db sync");
+        assert_eq!(out.generation, 1, "first apply gets generation 1");
+
+        // Verify state.toml grew a history entry.
+        let read_back = StateStore::new(state_path).read().expect("read state");
+        assert_eq!(read_back.history.len(), 1);
+        assert_eq!(read_back.history[0].generation, 1);
+        assert_eq!(read_back.history[0].actions_executed, 0);
+        assert_eq!(read_back.history[0].snapshot_pre.id, 1);
+        assert_eq!(read_back.history[0].snapshot_post.id, 2);
+        assert!(read_back.last_apply.is_some());
     }
 
     #[test]
@@ -336,6 +469,8 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let state_path = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -348,6 +483,7 @@ mod tests {
                 &systemd,
                 &snapper,
                 "root",
+                &state_path,
             )
             .expect("apply");
         assert_eq!(pacman.sync_count(), 0, "cargo-only plan must not sync");
@@ -363,9 +499,16 @@ mod tests {
                 &systemd,
                 &snapper,
                 "root",
+                &state_path,
             )
             .expect("apply");
         assert_eq!(pacman.sync_count(), 1, "pacman install triggers sync");
+
+        // Two applies → two history entries with generations 1 and 2.
+        let read_back = StateStore::new(state_path).read().expect("read state");
+        assert_eq!(read_back.history.len(), 2);
+        assert_eq!(read_back.history[0].generation, 1);
+        assert_eq!(read_back.history[1].generation, 2);
     }
 
     #[test]
@@ -374,6 +517,8 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let state_path = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -386,6 +531,7 @@ mod tests {
                 &systemd,
                 &snapper,
                 "root",
+                &state_path,
             )
             .expect("apply");
         assert_eq!(
@@ -403,6 +549,8 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let state_path = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -414,6 +562,7 @@ mod tests {
                 &systemd,
                 &snapper,
                 "root",
+                &state_path,
             )
             .expect("apply");
         assert_eq!(pacman.aur_install_history(), vec![vec!["yay".to_owned()]]);
@@ -426,6 +575,8 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let state_path = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -443,6 +594,7 @@ mod tests {
                 &systemd,
                 &snapper,
                 "root",
+                &state_path,
             )
             .expect("apply");
         assert_eq!(cargo.uninstall_history(), vec!["old-crate".to_owned()]);
@@ -455,6 +607,8 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let state_path = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -475,6 +629,7 @@ mod tests {
                 &systemd,
                 &snapper,
                 "root",
+                &state_path,
             )
             .expect("apply");
         assert_eq!(
@@ -491,6 +646,8 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let state_path = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -505,6 +662,7 @@ mod tests {
                 &systemd,
                 &snapper,
                 "root",
+                &state_path,
             )
             .expect("apply");
         assert_eq!(
@@ -526,6 +684,8 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let state_path = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -547,6 +707,7 @@ mod tests {
                 &systemd,
                 &snapper,
                 "root",
+                &state_path,
             )
             .expect("apply");
 
@@ -562,6 +723,8 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let state_path = setup_state(&state_dir);
 
         engine()
             .apply_plan(
@@ -583,6 +746,7 @@ mod tests {
                 &systemd,
                 &snapper,
                 "root",
+                &state_path,
             )
             .expect("apply");
 
@@ -597,6 +761,8 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let state_path = setup_state(&state_dir);
 
         let out = engine()
             .apply_plan(
@@ -609,6 +775,7 @@ mod tests {
                 &systemd,
                 &snapper,
                 "root",
+                &state_path,
             )
             .expect("apply");
         assert_eq!(out.snapshot_pre.id, 1);
@@ -645,10 +812,10 @@ mod tests {
 
     #[test]
     fn config_write_writes_target_atomically() {
-        use tempfile::TempDir;
-
         let repo = TempDir::new().expect("repo tempdir");
         let target_dir = TempDir::new().expect("target tempdir");
+        let state_dir = TempDir::new().expect("state tempdir");
+        let state_path = setup_state(&state_dir);
 
         let source_rel = PathBuf::from("etc/hello.conf");
         let source_abs = repo.path().join(&source_rel);
@@ -681,6 +848,7 @@ mod tests {
                 &systemd,
                 &snapper,
                 "root",
+                &state_path,
             )
             .expect("apply");
 
@@ -689,10 +857,10 @@ mod tests {
 
     #[test]
     fn config_write_sha_mismatch_aborts_apply() {
-        use tempfile::TempDir;
-
         let repo = TempDir::new().expect("repo tempdir");
         let target_dir = TempDir::new().expect("target tempdir");
+        let state_dir = TempDir::new().expect("state tempdir");
+        let state_path = setup_state(&state_dir);
 
         let source_rel = PathBuf::from("etc/x.conf");
         let source_abs = repo.path().join(&source_rel);
@@ -724,6 +892,7 @@ mod tests {
                 &systemd,
                 &snapper,
                 "root",
+                &state_path,
             )
             .expect_err("must fail");
         assert!(
@@ -731,14 +900,21 @@ mod tests {
             "got {err:?}"
         );
         assert!(!target.exists(), "target must not be created on mismatch");
+
+        // Failure path: state.toml history must NOT have grown.
+        let read_back = StateStore::new(state_path).read().expect("read state");
+        assert!(
+            read_back.history.is_empty(),
+            "failed apply must not append history"
+        );
     }
 
     #[test]
     fn config_write_missing_source_yields_fs_error() {
-        use tempfile::TempDir;
-
         let repo = TempDir::new().expect("repo tempdir");
         let target_dir = TempDir::new().expect("target tempdir");
+        let state_dir = TempDir::new().expect("state tempdir");
+        let state_path = setup_state(&state_dir);
 
         let target = target_dir.path().join("missing.conf");
         let (user, group) = current_user_group();
@@ -764,6 +940,7 @@ mod tests {
                 &systemd,
                 &snapper,
                 "root",
+                &state_path,
             )
             .expect_err("must fail");
         assert!(matches!(err, ApplyError::Fs(_)), "got {err:?}");
@@ -798,6 +975,8 @@ mod tests {
         let pacman = MockPacman::new();
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let state_path = setup_state(&state_dir);
 
         let err = engine()
             .apply_plan(
@@ -807,8 +986,83 @@ mod tests {
                 &systemd,
                 &FailingSnapper,
                 "root",
+                &state_path,
             )
             .expect_err("must fail");
         assert!(matches!(err, ApplyError::Snapper(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn missing_state_toml_yields_state_error() {
+        let pacman = MockPacman::new();
+        let cargo = MockCargo::new();
+        let systemd = MockSystemd::new();
+        let snapper = MockSnapper::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        // Don't write a base state — apply_plan must error rather than
+        // silently creating one.
+        let state_path = state_dir.path().join("state.toml");
+
+        let err = engine()
+            .apply_plan(
+                &plan_with_actions(vec![]),
+                &pacman,
+                &cargo,
+                &systemd,
+                &snapper,
+                "root",
+                &state_path,
+            )
+            .expect_err("must fail");
+        assert!(matches!(err, ApplyError::State(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn summary_counts_actions_by_kind() {
+        let pacman = MockPacman::new();
+        let cargo = MockCargo::new();
+        let systemd = MockSystemd::new();
+        let snapper = MockSnapper::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let state_path = setup_state(&state_dir);
+
+        engine()
+            .apply_plan(
+                &plan_with_actions(vec![
+                    Action::PacmanInstall {
+                        repo: "core".to_owned(),
+                        packages: vec!["a".to_owned(), "b".to_owned()],
+                    },
+                    Action::PacmanRemove {
+                        packages: vec!["c".to_owned()],
+                    },
+                    Action::ServiceEnable {
+                        unit: "x.service".to_owned(),
+                        scope: Scope::System,
+                    },
+                ]),
+                &pacman,
+                &cargo,
+                &systemd,
+                &snapper,
+                "root",
+                &state_path,
+            )
+            .expect("apply");
+
+        let read_back = StateStore::new(state_path).read().expect("read state");
+        let summary = &read_back.history[0].summary;
+        assert!(
+            summary.contains("+2"),
+            "summary must show 2 installs: {summary}"
+        );
+        assert!(
+            summary.contains("-1"),
+            "summary must show 1 removal: {summary}"
+        );
+        assert!(
+            summary.contains("1 service-state"),
+            "summary must show service-state count: {summary}"
+        );
     }
 }
