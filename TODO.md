@@ -39,23 +39,23 @@
 ## M1 — Read-Only Plan (3 weeks)
 
 ### Week 1 — Pure crates
-- [ ] `pearlite-schema`: full implementation per Plan §6.1
-- [ ] `pearlite-state`: FileSystem trait, atomic write, migration framework
-- [ ] `pearlite-fs`: sha256, atomic write, ConfigFileInventory
+- [✓] `pearlite-schema`: full implementation per Plan §6.1 (PRs #3 / #4 / #5)
+- [✓] `pearlite-state`: FileSystem trait, atomic write, migration framework (PRs #6 / #7 / #8)
+- [✓] `pearlite-fs`: sha256, atomic write, ConfigFileInventory (PR #9)
 
 ### Week 2 — Adapter probe paths
-- [ ] `pearlite-pacman::inventory` + classification (no install/remove yet)
-- [ ] `pearlite-cargo::inventory`
-- [ ] `pearlite-systemd::inventory`
-- [ ] `pearlite-nickel` (LiveNickel + MockNickel)
+- [✓] `pearlite-pacman::inventory` + classification (no install/remove yet) (PR #13)
+- [✓] `pearlite-cargo::inventory` (PR #11)
+- [✓] `pearlite-systemd::inventory` (PR #12)
+- [✓] `pearlite-nickel` (LiveNickel + MockNickel) (PR #10)
 
 ### Week 3 — Diff and CLI wiring
-- [ ] `pearlite-diff::plan()` with property tests
-- [ ] `pearlite-engine::plan()` (probe + diff composition)
-- [ ] `pearlite-cli`: `plan`, `status`, `schema --bare` subcommands
-- [ ] JSON envelope rendering
-- [ ] VM scenario `vm-01-bootstrap-and-plan.sh`
-- [ ] Tag `m1-exit`
+- [✓] `pearlite-diff::plan()` with property tests (PRs #14 / #15 / #16)
+- [✓] `pearlite-engine::plan()` (probe + diff composition) (PR #17)
+- [✓] `pearlite-cli`: `plan`, `status`, `schema --bare` subcommands (PR #18)
+- [✓] JSON envelope rendering (PR #18)
+- [ ] VM scenario `vm-01-bootstrap-and-plan.sh` — deferred to M2 W3 per M1 retrospective (needs self-hosted CachyOS runner)
+- [~] Tag `m1-exit` (signed tag from this commit)
 
 ---
 
