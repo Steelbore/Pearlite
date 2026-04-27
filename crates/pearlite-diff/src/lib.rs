@@ -11,6 +11,7 @@
 
 mod action;
 mod classify;
+mod coherence;
 mod compose;
 mod order;
 mod plan;
@@ -20,5 +21,6 @@ pub use classify::{
     CargoClassification, ConfigClassification, ConfigFileDrift, PacmanClassification,
     ServicesClassification, classify_cargo, classify_config, classify_pacman, classify_services,
 };
+pub use coherence::FailureCoherence;
 pub use compose::plan;
 pub use plan::{DriftCategory, DriftItem, Plan, Warning};
