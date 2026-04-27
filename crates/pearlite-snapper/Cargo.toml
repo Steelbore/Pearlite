@@ -11,4 +11,11 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-mocks = []
+
 [dependencies]
+serde = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
