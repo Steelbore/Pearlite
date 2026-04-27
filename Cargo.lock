@@ -498,6 +498,7 @@ dependencies = [
  "pearlite-nickel",
  "pearlite-pacman",
  "pearlite-schema",
+ "pearlite-snapper",
  "pearlite-state",
  "pearlite-systemd",
  "rayon",
