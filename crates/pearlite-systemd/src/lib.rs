@@ -4,9 +4,12 @@
 //! systemctl adapter: enable, disable, mask, restart for system and
 //! user scopes.
 //!
-//! At M1 only the read side ([`Systemd::inventory`]) is implemented.
-//! Apply-side methods (enable, disable, mask, restart) and user-scope
-//! support arrive in M2 per Plan §7.3.
+//! Read side: [`Systemd::inventory`] parses `list-unit-files` and
+//! `list-units`.
+//! Apply side: [`Systemd::enable`], [`Systemd::disable`],
+//! [`Systemd::mask`], [`Systemd::restart`] match the four service-side
+//! [`Action`](pearlite_diff::Action) variants 1:1. User-scope ops
+//! dispatch through `runuser -u <name> -- systemctl --user ...`.
 
 mod errors;
 mod inventory;
@@ -16,7 +19,7 @@ mod mock;
 
 pub use errors::SystemdError;
 pub use inventory::{compose_inventory, parse_list_unit_files, parse_list_units};
-pub use live::{LiveSystemd, Systemd};
+pub use live::{LiveSystemd, Scope, Systemd};
 
 #[cfg(feature = "test-mocks")]
 pub use mock::MockSystemd;
