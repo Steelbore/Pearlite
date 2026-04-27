@@ -12,9 +12,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+pearlite-schema = { path = "../pearlite-schema", version = "0.1" }
+pearlite-state = { path = "../pearlite-state", version = "0.1" }
 serde = { workspace = true }
 schemars = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
-# pearlite-schema, pearlite-state, thiserror arrive in chunk M1-W3-B
-# with the classification logic that consumes them.
