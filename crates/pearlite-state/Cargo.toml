@@ -11,6 +11,10 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exposes MockFs to downstream crates for engine integration tests.
+test-mocks = []
+
 [dependencies]
 serde = { workspace = true }
 toml = { workspace = true }
@@ -22,3 +26,4 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+proptest = "1"

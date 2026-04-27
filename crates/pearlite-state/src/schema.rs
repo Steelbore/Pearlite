@@ -30,7 +30,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// for equality checks in tests.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct State {
-    /// Schema version of the file at last write.
+    /// Schema version of the file at last write. Absent or `0` means a
+    /// pre-versioned file written by an alpha build; the migration
+    /// framework in `migrate.rs` upgrades it on read.
+    #[serde(default)]
     pub schema_version: u32,
     /// Hostname this state belongs to. Mismatch with `hostname()` is
     /// preflight Class 1.
