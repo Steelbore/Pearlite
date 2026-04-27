@@ -3,15 +3,19 @@
 
 //! pacman/paru adapter: inventory, repo classification, install, remove.
 //!
-//! At M1 only the read side is implemented:
+//! Read side:
 //! - [`Pacman::inventory`] — explicit + foreign packages with per-package
 //!   repo classification.
 //! - [`detect_arch_level`] — `/proc/cpuinfo` → [`ArchLevel`].
 //! - [`Repo`] — typed repository identifier covering CachyOS's per-feature
 //!   repos plus standard Arch + AUR.
 //!
-//! Apply-side methods (`install`, `remove`, `sync_databases`) arrive in M2
-//! per Plan §7.3.
+//! Apply side (matches the four pacman-side
+//! [`Action`](pearlite_diff::Action) variants):
+//! - [`Pacman::sync_databases`] — `pacman -Sy` (PRD §8.2 phase 0.5).
+//! - [`Pacman::install`] — qualified `pacman -S <repo>/<pkg>`.
+//! - [`Pacman::aur_install`] — `paru -S` for AUR sources.
+//! - [`Pacman::remove`] — `pacman -R`.
 
 mod errors;
 mod inventory;
