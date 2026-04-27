@@ -51,8 +51,22 @@ pub enum Action {
     ConfigWrite {
         /// Absolute destination path (e.g. `/etc/sshd_config`).
         target: PathBuf,
-        /// SHA-256 of the content to write, hex-encoded.
+        /// Path of the source file relative to the user's config repo
+        /// root. The engine resolves it as `repo_root.join(source)`
+        /// at apply time, reads the bytes, and verifies the digest
+        /// against [`Self::content_sha256`] before writing.
+        source: PathBuf,
+        /// SHA-256 of the content to write, hex-encoded. Recomputed at
+        /// apply time and compared against the source bytes; a
+        /// mismatch aborts the apply with a Class 3 error.
         content_sha256: String,
+        /// File mode (`stat(2).st_mode & 0o7777`) the target should
+        /// end up with after the write.
+        mode: u32,
+        /// Owner login name to chown the target to.
+        owner: String,
+        /// Group name to chown the target to.
+        group: String,
         /// Original index in the host's `[[config]]` array; the engine
         /// sorts within phase 4 by this value to honour the user's
         /// declared order (PRD §8.3).

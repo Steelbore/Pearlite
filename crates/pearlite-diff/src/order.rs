@@ -161,12 +161,20 @@ mod tests {
     fn config_writes_preserve_declaration_order() {
         let first = Action::ConfigWrite {
             target: PathBuf::from("/etc/b"),
+            source: PathBuf::from("etc/b"),
             content_sha256: "abc".to_owned(),
+            mode: 0o644,
+            owner: "root".to_owned(),
+            group: "root".to_owned(),
             declaration_index: 0,
         };
         let second = Action::ConfigWrite {
             target: PathBuf::from("/etc/a"),
+            source: PathBuf::from("etc/a"),
             content_sha256: "xyz".to_owned(),
+            mode: 0o644,
+            owner: "root".to_owned(),
+            group: "root".to_owned(),
             declaration_index: 1,
         };
         // /etc/b at index 0 sorts before /etc/a at index 1, even though

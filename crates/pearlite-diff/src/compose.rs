@@ -160,10 +160,6 @@ fn config_actions(
         let Some(entry) = declared.config_files.get(index) else {
             continue;
         };
-        // Reuse the declared SHA-256 the classifier already verified.
-        // The classifier left this in `drift[i].declared_sha256` for
-        // entries that need work; for clean compose, take it from the
-        // declared map. For simplicity, look up via index → drift item.
         let sha = class
             .drift
             .iter()
@@ -172,7 +168,11 @@ fn config_actions(
             .unwrap_or_default();
         actions.push(Action::ConfigWrite {
             target: entry.target.clone(),
+            source: entry.source.clone(),
             content_sha256: sha,
+            mode: entry.mode,
+            owner: entry.owner.clone(),
+            group: entry.group.clone(),
             declaration_index: index,
         });
         for unit in &entry.restart {

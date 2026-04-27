@@ -21,8 +21,9 @@ mod hash;
 mod inventory;
 
 pub use atomic::write_etc_atomic;
+pub use chown::{name_for_gid, name_for_uid};
 pub use errors::FsError;
-pub use hash::sha256_file;
+pub use hash::{sha256_bytes, sha256_file};
 pub use inventory::probe_config_files;
 
 #[doc(no_inline)]

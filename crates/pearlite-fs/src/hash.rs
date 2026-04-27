@@ -11,6 +11,18 @@ use std::path::Path;
 
 const CHUNK: usize = 64 * 1024;
 
+/// Compute the SHA-256 of an in-memory byte slice.
+///
+/// Useful when the caller has already read the bytes (e.g. apply's
+/// `ConfigWrite` reads the source once and verifies the digest before
+/// writing).
+#[must_use]
+pub fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
 /// Compute the SHA-256 of the file at `p`, returning the 32-byte digest.
 ///
 /// Reads the file in 64 KiB chunks so memory usage stays constant
