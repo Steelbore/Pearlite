@@ -20,8 +20,11 @@ test-doc:
     cargo test --workspace --doc
 
 # Dependency audit: CVEs, licenses, duplicates.
+# Ignored advisories are documented in audit.toml + deny.toml; passed
+# explicitly here because cargo-audit's auto-discovery of audit.toml is
+# unreliable across versions.
 audit:
-    cargo audit
+    cargo audit --ignore RUSTSEC-2026-0009
     cargo deny check
 
 # Detect unused dependencies.
