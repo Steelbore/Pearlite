@@ -11,4 +11,35 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-mocks = [
+    "pearlite-cargo/test-mocks",
+    "pearlite-nickel/test-mocks",
+    "pearlite-pacman/test-mocks",
+    "pearlite-state/test-mocks",
+    "pearlite-systemd/test-mocks",
+]
+
 [dependencies]
+pearlite-cargo = { path = "../pearlite-cargo", version = "0.1" }
+pearlite-diff = { path = "../pearlite-diff", version = "0.1" }
+pearlite-fs = { path = "../pearlite-fs", version = "0.1" }
+pearlite-nickel = { path = "../pearlite-nickel", version = "0.1" }
+pearlite-pacman = { path = "../pearlite-pacman", version = "0.1" }
+pearlite-schema = { path = "../pearlite-schema", version = "0.1" }
+pearlite-state = { path = "../pearlite-state", version = "0.1" }
+pearlite-systemd = { path = "../pearlite-systemd", version = "0.1" }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# Adapter mocks need their crates' test-mocks feature; declared as
+# dev-deps so cargo unifies the feature set without forcing every
+# downstream consumer to enable it.
+pearlite-cargo = { path = "../pearlite-cargo", version = "0.1", features = ["test-mocks"] }
+pearlite-nickel = { path = "../pearlite-nickel", version = "0.1", features = ["test-mocks"] }
+pearlite-pacman = { path = "../pearlite-pacman", version = "0.1", features = ["test-mocks"] }
+pearlite-systemd = { path = "../pearlite-systemd", version = "0.1", features = ["test-mocks"] }
+tempfile = { workspace = true }
