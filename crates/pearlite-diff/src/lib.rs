@@ -10,7 +10,12 @@
 //! arrive in subsequent chunks.
 
 mod action;
+mod classify;
 mod plan;
 
 pub use action::{Action, Phase, Scope};
+pub use classify::{
+    CargoClassification, ConfigClassification, ConfigFileDrift, PacmanClassification,
+    ServicesClassification, classify_cargo, classify_config, classify_pacman, classify_services,
+};
 pub use plan::{DriftCategory, DriftItem, Plan, Warning};
