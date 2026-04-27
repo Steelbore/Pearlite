@@ -12,3 +12,12 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+pearlite-schema = { path = "../pearlite-schema" }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+nix = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
