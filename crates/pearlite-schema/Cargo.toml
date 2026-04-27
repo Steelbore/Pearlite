@@ -1,0 +1,14 @@
+[package]
+name = "pearlite-schema"
+description = "Resolved configuration types for Pearlite."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

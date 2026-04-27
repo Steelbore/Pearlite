@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: T1 — Lint
+    runs-on: ubuntu-latest
+    container: ghcr.io/cachyos/cachyos:latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+        with:
+          components: rustfmt, clippy
+      - uses: extractions/setup-just@v3
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --locked
+      - run: just check
+      - run: just spdx
+      - run: just unused
+
+  test:
+    name: T2 — Unit
+    runs-on: ubuntu-latest
+    container: ghcr.io/cachyos/cachyos:latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v3
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked
+      - run: just test
+      - run: just test-doc
+
+  audit:
+    name: T3 — Adapter / audit
+    runs-on: ubuntu-latest
+    container: ghcr.io/cachyos/cachyos:latest
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v3
+      - name: Install cargo-audit + cargo-deny
+        run: cargo install cargo-audit cargo-deny --locked
+      - run: just audit
+      - run: just compliance

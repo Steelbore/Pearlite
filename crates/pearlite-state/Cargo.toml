@@ -1,0 +1,14 @@
+[package]
+name = "pearlite-state"
+description = "Atomic, schema-versioned read/write of Pearlite's state.toml."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

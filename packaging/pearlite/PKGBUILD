@@ -1,0 +1,41 @@
+# Maintainer: Mohamed Hammad <unbreakablemj@gmail.com>
+
+pkgname=pearlite
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Declarative system management for CachyOS (built from source)"
+arch=('x86_64')
+url="https://github.com/Steelbore/Pearlite"
+license=('GPL-3.0-or-later')
+provides=('pearlite')
+conflicts=('pearlite-bin' 'pearlite-git')
+depends=('paru' 'snapper' 'nickel-lang' 'btrfs-progs' 'systemd')
+makedepends=('rust>=1.85' 'cargo')
+optdepends=(
+    'nix: required when [users.<name>.home_manager] is declared'
+    'home-manager: required for user-environment management'
+    'rustup: required when [packages.cargo] is non-empty'
+)
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Steelbore/Pearlite/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+# TODO(M6): replace SKIP with the real digest and add validpgpkeys.
+
+build() {
+    cd "$pkgname-$pkgver"
+    export RUSTFLAGS="-C target-cpu=x86-64-v3 -C opt-level=3 -C lto=fat -C codegen-units=1"
+    cargo build --release --frozen --workspace
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    cargo test --release --frozen --workspace
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 "target/release/pearlite" "$pkgdir/usr/bin/pearlite"
+    install -Dm755 "target/release/pearlite-audit" "$pkgdir/usr/bin/pearlite-audit"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    # TODO(M6): install man pages and shell completions for bash/zsh/fish/nu.
+}

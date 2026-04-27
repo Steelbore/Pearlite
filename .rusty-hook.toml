@@ -1,0 +1,6 @@
+[hooks]
+pre-commit = "just check && just spdx"
+pre-push = "just test"
+
+[logging]
+verbose = true

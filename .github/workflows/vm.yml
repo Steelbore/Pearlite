@@ -1,0 +1,22 @@
+name: VM Integration
+
+# T4 — full bootstrap → reconcile → apply → rollback inside a CachyOS qemu
+# image. Self-hosted runner required (GitHub-hosted runners cannot nest
+# virtualization). Skeleton only at M0; scenarios land in M1+.
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  # nightly at 04:00 UTC
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+
+jobs:
+  vm:
+    name: T4 — VM scenarios
+    if: github.event_name != 'pull_request' || github.event.label.name == 'vm-test'
+    runs-on: [self-hosted, cachyos, vm-host]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run VM scenarios
+        run: just vm-test

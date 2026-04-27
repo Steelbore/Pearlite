@@ -1,0 +1,29 @@
+# Maintainer: Mohamed Hammad <unbreakablemj@gmail.com>
+
+pkgname=pearlite-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Declarative system management for CachyOS (pre-built binary)"
+arch=('x86_64')
+url="https://github.com/Steelbore/Pearlite"
+license=('GPL-3.0-or-later')
+provides=('pearlite')
+conflicts=('pearlite' 'pearlite-git')
+depends=('paru' 'snapper' 'nickel-lang' 'btrfs-progs' 'systemd')
+optdepends=(
+    'nix: required when [users.<name>.home_manager] is declared'
+    'home-manager: required for user-environment management'
+    'rustup: required when [packages.cargo] is non-empty'
+)
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Steelbore/Pearlite/releases/download/v$pkgver/pearlite-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+sha256sums=('SKIP')
+# TODO(M6): replace SKIP with the real digest, add a .sig source, and set
+# validpgpkeys to the maintainer's sequoia-chameleon-gnupg fingerprint.
+
+package() {
+    install -Dm755 "$srcdir/pearlite" "$pkgdir/usr/bin/pearlite"
+    install -Dm755 "$srcdir/pearlite-audit" "$pkgdir/usr/bin/pearlite-audit"
+    install -Dm644 "$srcdir/LICENSE" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    # TODO(M6): install man pages and shell completions for bash/zsh/fish/nu.
+}

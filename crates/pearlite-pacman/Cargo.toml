@@ -1,0 +1,14 @@
+[package]
+name = "pearlite-pacman"
+description = "pacman and paru adapter for Pearlite package management."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

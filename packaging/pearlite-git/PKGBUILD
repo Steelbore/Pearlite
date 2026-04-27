@@ -1,0 +1,48 @@
+# Maintainer: Mohamed Hammad <unbreakablemj@gmail.com>
+
+pkgname=pearlite-git
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc="Declarative system management for CachyOS (git HEAD)"
+arch=('x86_64')
+url="https://github.com/Steelbore/Pearlite"
+license=('GPL-3.0-or-later')
+provides=('pearlite')
+conflicts=('pearlite' 'pearlite-bin')
+depends=('paru' 'snapper' 'nickel-lang' 'btrfs-progs' 'systemd')
+makedepends=('rust>=1.85' 'cargo' 'git')
+optdepends=(
+    'nix: required when [users.<name>.home_manager] is declared'
+    'home-manager: required for user-environment management'
+    'rustup: required when [packages.cargo] is non-empty'
+)
+source=("$pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$pkgname"
+    printf "%s.r%s.g%s" \
+        "$(grep -m1 '^version' Cargo.toml | sed 's/version = "\([^"]*\)"/\1/')" \
+        "$(git rev-list --count HEAD)" \
+        "$(git rev-parse --short HEAD)"
+}
+
+build() {
+    cd "$pkgname"
+    export RUSTFLAGS="-C target-cpu=x86-64-v3 -C opt-level=3 -C lto=fat -C codegen-units=1"
+    cargo build --release --workspace
+}
+
+check() {
+    cd "$pkgname"
+    cargo test --release --workspace
+}
+
+package() {
+    cd "$pkgname"
+    install -Dm755 "target/release/pearlite" "$pkgdir/usr/bin/pearlite"
+    install -Dm755 "target/release/pearlite-audit" "$pkgdir/usr/bin/pearlite-audit"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    # TODO(M6): install man pages and shell completions for bash/zsh/fish/nu.
+}

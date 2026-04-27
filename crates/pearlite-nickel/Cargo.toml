@@ -1,0 +1,14 @@
+[package]
+name = "pearlite-nickel"
+description = "Nickel evaluator adapter for Pearlite host configurations."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
