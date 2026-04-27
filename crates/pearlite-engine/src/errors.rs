@@ -60,6 +60,9 @@ pub enum ApplyError {
         /// SHA-256 actually read at apply time.
         actual: String,
     },
+    /// `state.toml` read or write failed during the phase-9 commit.
+    #[error(transparent)]
+    State(#[from] pearlite_state::StateError),
 }
 
 /// Errors emitted by [`Engine::plan`](crate::Engine::plan) and friends.
