@@ -43,7 +43,7 @@ jobs:
       - uses: extractions/setup-just@v3
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest,nickel-lang
       - run: just test
       - run: just test-doc
 

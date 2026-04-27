@@ -1,0 +1,12 @@
+{
+  meta = {
+    hostname = "forge",
+    timezone = "Europe/London",
+    arch_level = "v4",
+    locale = "en_US.UTF-8",
+    keymap = "us",
+  },
+  kernel = {
+    package = "linux-cachyos",
+  },
+}

@@ -11,4 +11,9 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-mocks = []
+
 [dependencies]
+pearlite-schema = { path = "../pearlite-schema", version = "0.1" }
+thiserror = { workspace = true }
