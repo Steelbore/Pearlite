@@ -22,6 +22,37 @@ pub enum ProbeError {
     Io(#[from] std::io::Error),
 }
 
+/// Errors emitted while applying a [`Plan`](pearlite_diff::Plan).
+///
+/// Each variant wraps the failure of one adapter; the apply orchestrator
+/// halts on the first error, so the variant identifies the failing
+/// subsystem. PRD §8.5 failure-class mapping is performed at the CLI
+/// boundary using [`pearlite_diff::Action::failure_coherence`] on the
+/// action that triggered the error.
+#[derive(Debug, Error)]
+pub enum ApplyError {
+    /// Snapper adapter failed (pre / post snapshot).
+    #[error(transparent)]
+    Snapper(#[from] pearlite_snapper::SnapperError),
+    /// pacman/paru adapter failed (`sync_databases` / install / remove).
+    #[error(transparent)]
+    Pacman(#[from] pearlite_pacman::PacmanError),
+    /// cargo adapter failed (install / uninstall).
+    #[error(transparent)]
+    Cargo(#[from] pearlite_cargo::CargoError),
+    /// systemd adapter failed (enable / disable / mask / restart).
+    #[error(transparent)]
+    Systemd(#[from] pearlite_systemd::SystemdError),
+    /// `ConfigWrite` action encountered before the phase-4 implementation
+    /// lands. This skeleton apply treats it as a hard error so callers
+    /// don't silently skip declared config writes.
+    #[error("ConfigWrite phase not yet implemented (target: {target})")]
+    ConfigWriteNotYetImplemented {
+        /// Target path the action wanted to write.
+        target: std::path::PathBuf,
+    },
+}
+
 /// Errors emitted by [`Engine::plan`](crate::Engine::plan) and friends.
 #[derive(Debug, Error)]
 pub enum EngineError {

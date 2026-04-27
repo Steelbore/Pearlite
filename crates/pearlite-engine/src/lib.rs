@@ -7,11 +7,13 @@
 //! At M1 only the read-only [`Engine::plan`] path is implemented.
 //! Apply, rollback, and reconcile arrive in M2+ per Plan §7.
 
+mod apply;
 mod errors;
 mod plan;
 mod probe;
 
-pub use errors::{EngineError, ProbeError};
+pub use apply::ApplyOutcome;
+pub use errors::{ApplyError, EngineError, ProbeError};
 pub use plan::Engine;
 pub use probe::{LiveProbe, SystemProbe};
 

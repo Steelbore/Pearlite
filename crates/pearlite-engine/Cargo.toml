@@ -16,6 +16,7 @@ test-mocks = [
     "pearlite-cargo/test-mocks",
     "pearlite-nickel/test-mocks",
     "pearlite-pacman/test-mocks",
+    "pearlite-snapper/test-mocks",
     "pearlite-state/test-mocks",
     "pearlite-systemd/test-mocks",
 ]
@@ -27,6 +28,7 @@ pearlite-fs = { path = "../pearlite-fs", version = "0.1" }
 pearlite-nickel = { path = "../pearlite-nickel", version = "0.1" }
 pearlite-pacman = { path = "../pearlite-pacman", version = "0.1" }
 pearlite-schema = { path = "../pearlite-schema", version = "0.1" }
+pearlite-snapper = { path = "../pearlite-snapper", version = "0.1" }
 pearlite-state = { path = "../pearlite-state", version = "0.1" }
 pearlite-systemd = { path = "../pearlite-systemd", version = "0.1" }
 rayon = { workspace = true }
@@ -41,5 +43,6 @@ uuid = { workspace = true }
 pearlite-cargo = { path = "../pearlite-cargo", version = "0.1", features = ["test-mocks"] }
 pearlite-nickel = { path = "../pearlite-nickel", version = "0.1", features = ["test-mocks"] }
 pearlite-pacman = { path = "../pearlite-pacman", version = "0.1", features = ["test-mocks"] }
+pearlite-snapper = { path = "../pearlite-snapper", version = "0.1", features = ["test-mocks"] }
 pearlite-systemd = { path = "../pearlite-systemd", version = "0.1", features = ["test-mocks"] }
 tempfile = { workspace = true }
