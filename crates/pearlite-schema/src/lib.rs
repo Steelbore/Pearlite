@@ -15,16 +15,19 @@ mod declared;
 mod errors;
 mod host;
 mod packages;
+mod parse;
 mod probed;
 mod services;
 mod snapshots;
 mod users;
+mod validate;
 
 pub use config::{ConfigEntry, RemovePolicy};
 pub use declared::DeclaredState;
 pub use errors::{ContractViolation, SchemaError};
 pub use host::{ArchLevel, HostMeta, KernelDecl};
 pub use packages::PackageSet;
+pub use parse::from_resolved_toml;
 pub use probed::{
     CargoInventory, ConfigFileInventory, ConfigFileMeta, HostInfo, KernelInfo, PacmanInventory,
     ProbedState, ServiceInventory,
@@ -32,3 +35,4 @@ pub use probed::{
 pub use services::ServicesDecl;
 pub use snapshots::SnapshotPolicy;
 pub use users::{HomeManagerDecl, HomeManagerMode, UserDecl};
+pub use validate::validate;
