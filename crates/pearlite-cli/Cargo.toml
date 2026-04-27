@@ -32,4 +32,5 @@ time = { workspace = true }
 [dev-dependencies]
 pearlite-engine = { path = "../pearlite-engine", version = "0.1", features = ["test-mocks"] }
 pearlite-nickel = { path = "../pearlite-nickel", version = "0.1", features = ["test-mocks"] }
+pearlite-schema = { path = "../pearlite-schema", version = "0.1" }
 tempfile = { workspace = true }
