@@ -1,3 +1,17 @@
 # Lint levels live in Cargo.toml [workspace.lints.clippy].
 # This file reserved for clippy configuration knobs (msrv, etc.) when needed.
 msrv = "1.85"
+
+# Proper nouns that legitimately appear in doc comments. The `..` token
+# extends clippy's built-in list (KiB, RFC, MIB, etc.) rather than
+# replacing it.
+doc-valid-idents = [
+    "CachyOS",
+    "JsonSchema",
+    "Nickel",
+    "NixOS",
+    "Pearlite",
+    "Snapper",
+    "Steelbore",
+    "..",
+]
