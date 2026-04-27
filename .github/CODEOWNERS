@@ -1,0 +1,6 @@
+# Pearlite CODEOWNERS — required reviewers per Plan §5.10.
+# Format: <pattern> <space-separated owners>
+# Patterns follow .gitignore syntax; later matches win.
+
+# Default: every change requires the maintainer's review.
+* @UnbreakableMJ
