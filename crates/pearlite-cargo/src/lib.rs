@@ -3,9 +3,11 @@
 
 //! cargo adapter: list installed crates; install and uninstall on apply.
 //!
-//! At M1 only the read side ([`Cargo::inventory`]) is implemented.
-//! Install/uninstall land in M2 with the rest of the apply-engine
-//! adapters per Plan §7.3.
+//! Read side: [`Cargo::inventory`] parses `cargo install --list`.
+//! Apply side: [`Cargo::install`] / [`Cargo::uninstall`] match the
+//! [`CargoInstall`](pearlite_diff::Action::CargoInstall) /
+//! [`CargoUninstall`](pearlite_diff::Action::CargoUninstall)
+//! `Action` variants 1:1.
 
 mod errors;
 mod inventory;

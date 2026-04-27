@@ -11,8 +11,10 @@ use std::process::Command;
 
 /// Trait the rest of the workspace consumes to talk to `cargo`.
 ///
-/// At M1 only [`inventory`](Self::inventory) is implemented. Install and
-/// uninstall arrive with M2's apply-engine wiring per Plan §7.3.
+/// One method per primitive operation the apply engine emits — each
+/// matches a single [`Action`](pearlite_diff::Action) variant on the
+/// cargo side: [`CargoInstall`](pearlite_diff::Action::CargoInstall)
+/// and [`CargoUninstall`](pearlite_diff::Action::CargoUninstall).
 pub trait Cargo: Send + Sync {
     /// Snapshot the `cargo install --list` output as a
     /// [`CargoInventory`].
@@ -21,6 +23,27 @@ pub trait Cargo: Send + Sync {
     /// Implementations propagate adapter-specific failures via
     /// [`CargoError`].
     fn inventory(&self) -> Result<CargoInventory, CargoError>;
+
+    /// Install one crate from crates.io.
+    ///
+    /// Calls `cargo install [--locked] <crate>`. `cargo install` is
+    /// per-crate by design (no batch form), so the engine emits one
+    /// [`Action::CargoInstall`](pearlite_diff::Action::CargoInstall)
+    /// per crate and the trait mirrors that.
+    ///
+    /// # Errors
+    /// Returns [`CargoError`] on spawn / non-zero exit.
+    fn install(&self, crate_name: &str, locked: bool) -> Result<(), CargoError>;
+
+    /// Uninstall one crate.
+    ///
+    /// Calls `cargo uninstall <crate>`. Fails if the crate isn't
+    /// installed; the diff engine's classification keeps that case
+    /// out of the apply plan.
+    ///
+    /// # Errors
+    /// Returns [`CargoError`] on spawn / non-zero exit.
+    fn uninstall(&self, crate_name: &str) -> Result<(), CargoError>;
 }
 
 /// Production [`Cargo`] backed by the `cargo` binary.
@@ -53,20 +76,9 @@ impl LiveCargo {
     pub fn binary(&self) -> &Path {
         &self.binary
     }
-}
 
-impl Default for LiveCargo {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Cargo for LiveCargo {
-    fn inventory(&self) -> Result<CargoInventory, CargoError> {
-        let output = match Command::new(&self.binary)
-            .args(["install", "--list"])
-            .output()
-        {
+    fn run(&self, args: &[&str]) -> Result<String, CargoError> {
+        let output = match Command::new(&self.binary).args(args).output() {
             Ok(o) => o,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(CargoError::NotInPath {
@@ -82,8 +94,36 @@ impl Cargo for LiveCargo {
             return Err(CargoError::InvocationFailed { code, stderr });
         }
 
-        let stdout = String::from_utf8(output.stdout)?;
+        Ok(String::from_utf8(output.stdout)?)
+    }
+}
+
+impl Default for LiveCargo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Cargo for LiveCargo {
+    fn inventory(&self) -> Result<CargoInventory, CargoError> {
+        let stdout = self.run(&["install", "--list"])?;
         Ok(parse_install_list(&stdout))
+    }
+
+    fn install(&self, crate_name: &str, locked: bool) -> Result<(), CargoError> {
+        let mut args: Vec<&str> = Vec::with_capacity(3);
+        args.push("install");
+        if locked {
+            args.push("--locked");
+        }
+        args.push(crate_name);
+        self.run(&args)?;
+        Ok(())
+    }
+
+    fn uninstall(&self, crate_name: &str) -> Result<(), CargoError> {
+        self.run(&["uninstall", crate_name])?;
+        Ok(())
     }
 }
 
@@ -97,10 +137,25 @@ impl Cargo for LiveCargo {
 mod tests {
     use super::*;
 
+    fn dead() -> LiveCargo {
+        LiveCargo::with_binary("/nonexistent/path/cargo-binary-12345")
+    }
+
     #[test]
     fn cargo_not_in_path_error_class() {
-        let live = LiveCargo::with_binary("/nonexistent/path/cargo-binary-12345");
-        let err = live.inventory().expect_err("must fail");
+        let err = dead().inventory().expect_err("must fail");
+        assert!(matches!(err, CargoError::NotInPath { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn install_not_in_path_error_class() {
+        let err = dead().install("zellij", false).expect_err("must fail");
+        assert!(matches!(err, CargoError::NotInPath { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn uninstall_not_in_path_error_class() {
+        let err = dead().uninstall("zellij").expect_err("must fail");
         assert!(matches!(err, CargoError::NotInPath { .. }), "got {err:?}");
     }
 
@@ -117,8 +172,6 @@ mod tests {
             return;
         }
         let inv = live.inventory().expect("inventory");
-        // Every crate name is a valid cargo package name (kebab-case
-        // alphanumerics + a few extras). Defensive sanity check.
         for name in inv.crates.keys() {
             assert!(!name.is_empty(), "empty crate name in inventory");
             assert!(!name.contains(' '), "crate name has whitespace: {name}");
