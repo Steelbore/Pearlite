@@ -10,6 +10,7 @@
 
 #![allow(
     clippy::expect_used,
+    clippy::missing_panics_doc,
     reason = "MockFs is a test utility; .expect() on the mutex matches the \
               standard Mutex<T> idiom and is unreachable in any sane test."
 )]
