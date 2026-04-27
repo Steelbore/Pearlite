@@ -14,6 +14,7 @@ mod classify;
 mod coherence;
 mod compose;
 mod order;
+mod phase;
 mod plan;
 
 pub use action::{Action, Phase, Scope};
@@ -23,4 +24,5 @@ pub use classify::{
 };
 pub use coherence::FailureCoherence;
 pub use compose::plan;
+pub use phase::ApplyPhase;
 pub use plan::{DriftCategory, DriftItem, Plan, Warning};
