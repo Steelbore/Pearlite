@@ -18,5 +18,7 @@ time = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 schemars = { workspace = true }
-# toml_edit lands in chunk M1-W1-E with the atomic-write implementation
-# that needs it for unknown-field preservation.
+tempfile = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

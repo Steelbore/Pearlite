@@ -11,14 +11,18 @@
 mod errors;
 mod failure;
 mod history;
+mod io;
 mod reconciliation;
 mod schema;
+mod store;
 
 pub use errors::StateError;
 pub use failure::FailureRef;
 pub use history::{HistoryEntry, SnapshotRef};
+pub use io::{FileSystem, LiveFs};
 pub use reconciliation::{ReconciliationAction, ReconciliationEntry};
 pub use schema::{
     Adopted, ConfigFileRecord, KernelRecord, Managed, SCHEMA_VERSION, ServicesState, State,
     UserEnvRecord,
 };
+pub use store::StateStore;
