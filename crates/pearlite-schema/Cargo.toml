@@ -12,3 +12,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+time = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }

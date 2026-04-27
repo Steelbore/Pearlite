@@ -1,0 +1,10 @@
+# cargo-audit configuration. Mirror of deny.toml's [advisories] ignore list,
+# kept in sync because the two tools read different config files.
+
+[advisories]
+ignore = [
+    # See deny.toml for the full exposure analysis. In short: time 0.3.47
+    # bumps MSRV to 1.88; we pin 1.85; the DoS surface is unreachable
+    # through any Pearlite API. TODO(M1 close): ADR-008 + MSRV bump.
+    "RUSTSEC-2026-0009",
+]
