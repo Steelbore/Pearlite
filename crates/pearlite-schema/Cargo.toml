@@ -17,3 +17,6 @@ toml = { workspace = true }
 time = { workspace = true }
 schemars = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
