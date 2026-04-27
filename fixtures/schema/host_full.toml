@@ -1,0 +1,60 @@
+[meta]
+hostname = "forge"
+timezone = "Europe/London"
+arch_level = "v4"
+locale = "en_GB.UTF-8"
+keymap = "us"
+
+[kernel]
+package = "linux-cachyos"
+cmdline = ["quiet", "splash", "nvidia_drm.modeset=1"]
+modules = ["nvidia", "nvidia_modeset", "nvidia_uvm", "nvidia_drm"]
+blacklist = ["nouveau"]
+
+[packages]
+core = ["base", "linux-cachyos", "btrfs-progs"]
+cachyos = ["cachyos-settings"]
+"cachyos-v3" = []
+"cachyos-v4" = ["firefox", "mpv", "blender"]
+aur = ["paru", "claude-code"]
+cargo = ["zellij", "ripgrep-all"]
+
+[[config]]
+target = "/etc/sshd_config"
+source = "etc/ssh/sshd_config"
+mode = 384
+owner = "root"
+group = "root"
+restart = ["sshd.service"]
+
+[[config]]
+target = "/etc/hosts"
+source = "etc/hosts"
+
+[services]
+enabled = ["sshd.service", "NetworkManager.service"]
+disabled = ["bluetooth.service"]
+masked = ["systemd-resolved.service"]
+
+[[users]]
+name = "mohamed"
+shell = "/usr/bin/nu"
+groups = ["wheel", "video", "render"]
+
+[users.home_manager]
+enabled = true
+mode = "standalone"
+config_path = "users/mohamed"
+channel = "release-24.11"
+
+[[users]]
+name = "guest"
+shell = "/bin/bash"
+groups = ["users"]
+
+[remove]
+packages = ["xterm"]
+ignore = ["nano"]
+
+[snapshots]
+keep = 30
