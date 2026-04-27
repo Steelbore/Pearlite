@@ -13,6 +13,6 @@ mod pacman;
 mod services;
 
 pub use cargo::{CargoClassification, classify_cargo};
-pub use config::{ConfigClassification, ConfigFileDrift, classify_config};
+pub use config::{ConfigClassification, ConfigDriftReason, ConfigFileDrift, classify_config};
 pub use pacman::{PacmanClassification, classify_pacman};
 pub use services::{ServicesClassification, classify_services};
