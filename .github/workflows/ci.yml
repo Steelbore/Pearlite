@@ -24,10 +24,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85
         with:
           components: rustfmt, clippy
-      - uses: extractions/setup-just@v3
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-machete
+          tool: just,cargo-machete
       - run: just check
       - run: just spdx
       - run: just unused
@@ -40,10 +39,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest,nickel-lang-cli
+          tool: just,cargo-nextest,nickel-lang-cli
       - run: just test
       - run: just test-doc
 
@@ -55,9 +53,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit,cargo-deny
+          tool: just,cargo-audit,cargo-deny
       - run: just audit
       - run: just compliance
