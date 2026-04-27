@@ -12,7 +12,7 @@ jobs:
   release:
     name: Build, sign, publish
     runs-on: ubuntu-latest
-    container: ghcr.io/cachyos/cachyos:latest
+    # TODO(M6): switch to a CachyOS container once the image is published.
     permissions:
       contents: write
     steps:
