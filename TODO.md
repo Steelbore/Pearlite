@@ -11,16 +11,16 @@
 - [✓] Pearlite PRD v1.0 (55 pages, 18 sections)
 - [✓] Pearlite Implementation Plan v1.0 (67 pages, 15 sections)
 - [ ] Mawaqit-style brand assets adapted for Pearlite (logo, README banner)
-- [ ] GitHub repository created at `github.com/Steelbore/Pearlite`
-- [ ] Branch protection on `main` configured (per Plan §3.4)
-- [ ] CODEOWNERS file authored
-- [ ] AUR namespaces reserved (`pearlite-bin`, `pearlite`, `pearlite-git`)
+- [✓] GitHub repository created at `github.com/Steelbore/Pearlite`
+- [✓] Branch protection on `main` configured (per Plan §3.4)
+- [✓] CODEOWNERS file authored
+- [ ] AUR namespaces reserved (`pearlite-bin`, `pearlite`, `pearlite-git`) — deferred to M6 per Plan §7.7
 
 ---
 
 ## M0 — Walking Skeleton (1 week)
 
-- [~] Init git repo; configure branch protection (local `git init` done; GitHub branch protection deferred until repo is pushed)
+- [✓] Init git repo; configure branch protection (Plan §3.4 + §5.10 active; `require_code_owner_reviews` true after CODEOWNERS landed via PR #1)
 - [✓] Workspace `Cargo.toml` (resolver "3", workspace metadata, lints, profiles)
 - [✓] `rust-toolchain.toml` pinning 1.85
 - [✓] `deny.toml`, `clippy.toml`, `rustfmt.toml`
@@ -32,7 +32,7 @@
 - [✓] GitHub Actions: `ci.yml`, `vm.yml` (skeleton), `release.yml` (skeleton)
 - [✓] `pearlite-audit` binary with one trivial check (SPDX-001) wired into CI
 - [✓] Three AUR PKGBUILDs (pearlite-bin, pearlite, pearlite-git) for `0.1.0-alpha.0`
-- [ ] Tag `m0-exit`; verify tarball + AUR build cleanly in CachyOS container
+- [~] Tag `m0-exit` (signed tag from this commit); CachyOS-container PKGBUILD verification deferred to M6 since the container itself is M1 work
 
 ---
 
