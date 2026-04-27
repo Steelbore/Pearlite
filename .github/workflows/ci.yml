@@ -10,21 +10,24 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# TODO(M1): each job should run inside a CachyOS container once the image is
+# published to GHCR (or we publish a custom one). M0 lint/build/test only
+# exercises Rust + POSIX tooling, so plain ubuntu-latest is sufficient and
+# unblocks the first PR.
+
 jobs:
   lint:
     name: T1 — Lint
     runs-on: ubuntu-latest
-    # TODO(M1): switch to a CachyOS container once the image is published to
-    # GHCR or replaced with a custom build. M0 only exercises Rust + POSIX
-    # tooling, so a plain ubuntu-latest runner suffices.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
         with:
           components: rustfmt, clippy
       - uses: extractions/setup-just@v3
-      - name: Install cargo-machete
-        run: cargo install cargo-machete --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
       - run: just check
       - run: just spdx
       - run: just unused
@@ -32,29 +35,29 @@ jobs:
   test:
     name: T2 — Unit
     runs-on: ubuntu-latest
-    container: ghcr.io/cachyos/cachyos:latest
     needs: [lint]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
       - uses: extractions/setup-just@v3
-      - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - run: just test
       - run: just test-doc
 
   audit:
     name: T3 — Adapter / audit
     runs-on: ubuntu-latest
-    container: ghcr.io/cachyos/cachyos:latest
     needs: [test]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
       - uses: extractions/setup-just@v3
-      - name: Install cargo-audit + cargo-deny
-        run: cargo install cargo-audit cargo-deny --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
       - run: just audit
       - run: just compliance
