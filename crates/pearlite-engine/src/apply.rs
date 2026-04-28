@@ -309,6 +309,7 @@ fn summarize(actions: &[Action]) -> String {
     let mut config_writes = 0u32;
     let mut service_state = 0u32;
     let mut restarts = 0u32;
+    let mut user_envs = 0u32;
     for a in actions {
         match a {
             Action::PacmanInstall { packages, .. } | Action::AurInstall { packages } => {
@@ -324,12 +325,14 @@ fn summarize(actions: &[Action]) -> String {
             | Action::ServiceDisable { .. }
             | Action::ServiceEnable { .. } => service_state += 1,
             Action::ServiceRestart { .. } => restarts += 1,
+            Action::UserEnvSwitch { .. } => user_envs += 1,
             Action::SnapshotCreate { .. } => {}
         }
     }
     format!(
         "+{installs} -{removals} ~{config_writes} ({installs} installs, {removals} removals, \
-         {config_writes} config updates, {service_state} service-state changes, {restarts} restarts)"
+         {config_writes} config updates, {service_state} service-state changes, {restarts} restarts, \
+         {user_envs} user-env switches)"
     )
 }
 
@@ -407,10 +410,13 @@ fn exec_action(
         Action::ServiceRestart { unit } => {
             systemd.restart(unit)?;
         }
-        // `SnapshotCreate` actions in plans are state-history records,
-        // not orchestration steps. The pre/post snapshot bookkeeping
-        // above handles every snapshot the apply engine actually takes.
-        Action::SnapshotCreate { .. } => {}
+        // Both arms below intentionally no-op. `UserEnvSwitch` is
+        // the phase-7 surface that lands its dispatch in the next
+        // M3 W2 PR (no diff classifier emits it yet, so a real
+        // apply never sees one); `SnapshotCreate` is a state-history
+        // record, never orchestrated here because the pre/post
+        // snapshot bookkeeping is taken directly by `apply_plan`.
+        Action::UserEnvSwitch { .. } | Action::SnapshotCreate { .. } => {}
     }
     Ok(())
 }
