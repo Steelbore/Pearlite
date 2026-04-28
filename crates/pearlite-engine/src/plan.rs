@@ -88,12 +88,18 @@ impl Engine {
         probed.config_files = Some(pearlite_fs::probe_config_files(&declared.config_files));
 
         let declared_source_sha256 = self.compute_source_sha256(&declared.config_files)?;
+        // M3 W2 placeholder: the user-env hash map is empty for now,
+        // which makes classify_user_env always emit a UserEnvSwitch
+        // for every HM-enabled user (first-apply path). The next PR
+        // wires the actual config-directory hash computation.
+        let declared_user_env_hash: BTreeMap<String, String> = BTreeMap::new();
 
         Ok(pearlite_diff::plan(
             &declared,
             &probed,
             state,
             &declared_source_sha256,
+            &declared_user_env_hash,
             Uuid::now_v7(),
             OffsetDateTime::now_utc(),
             prune,

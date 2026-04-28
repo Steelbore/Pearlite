@@ -11,8 +11,10 @@ mod cargo;
 mod config;
 mod pacman;
 mod services;
+mod user_env;
 
 pub use cargo::{CargoClassification, classify_cargo};
 pub use config::{ConfigClassification, ConfigDriftReason, ConfigFileDrift, classify_config};
 pub use pacman::{PacmanClassification, classify_pacman};
 pub use services::{ServicesClassification, classify_services};
+pub use user_env::{UserEnvClassification, UserToSwitch, classify_user_env};

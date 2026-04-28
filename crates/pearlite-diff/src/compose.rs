@@ -6,6 +6,7 @@
 use crate::action::{Action, Scope};
 use crate::classify::{
     ConfigDriftReason, classify_cargo, classify_config, classify_pacman, classify_services,
+    classify_user_env,
 };
 use crate::plan::{DriftCategory, DriftItem, Plan, Warning};
 use pearlite_schema::{DeclaredState, ProbedState};
@@ -33,12 +34,26 @@ use uuid::Uuid;
 /// `CargoUninstall` actions for every forgotten package; the
 /// drift-threshold guard that prevents mass-deletion lives at the
 /// CLI boundary, not here.
+///
+/// `declared_user_env_hash` maps each declared user (by login name)
+/// to a hex-encoded SHA-256 of their HM `config_path` directory. The
+/// engine computes these hashes; this crate stays I/O-free per
+/// Plan §6.3. Users without an entry in the map are treated as
+/// "hash missing" and re-applied defensively (see
+/// [`classify_user_env`] for the truth table).
 #[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "plan is the diff entry point; every parameter is a distinct \
+              piece of state the classifier needs and no logical grouping \
+              hides the load-bearing inputs"
+)]
 pub fn plan(
     declared: &DeclaredState,
     probed: &ProbedState,
     state: &State,
     declared_source_sha256: &BTreeMap<PathBuf, String>,
+    declared_user_env_hash: &BTreeMap<String, String>,
     plan_id: Uuid,
     generated_at: OffsetDateTime,
     prune: bool,
@@ -93,6 +108,10 @@ pub fn plan(
     };
     services_actions(&services_class, &mut actions);
     services_drift(&services_class, &mut drift);
+
+    // Phase 7: user-env (Home Manager) per declared user.
+    let user_env_class = classify_user_env(&declared.users, declared_user_env_hash, state);
+    user_env_actions(&user_env_class, &mut actions);
 
     actions.sort_by_key(Action::within_phase_key);
 
@@ -258,6 +277,19 @@ fn services_actions(class: &crate::ServicesClassification, actions: &mut Vec<Act
     }
 }
 
+/// Convert a [`UserEnvClassification`](crate::UserEnvClassification)
+/// into one [`Action::UserEnvSwitch`] per user that needs switching.
+fn user_env_actions(class: &crate::UserEnvClassification, actions: &mut Vec<Action>) {
+    for u in &class.to_switch {
+        actions.push(Action::UserEnvSwitch {
+            user: u.user.clone(),
+            config_path: u.config_path.clone(),
+            mode: u.mode,
+            channel: u.channel.clone(),
+        });
+    }
+}
+
 fn services_drift(class: &crate::ServicesClassification, drift: &mut Vec<DriftItem>) {
     for unit in &class.drift {
         drift.push(DriftItem {
@@ -358,6 +390,7 @@ mod tests {
             &probed_minimal(),
             &empty_state(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
             fixed_uuid(),
             fixed_time(),
             false,
@@ -384,6 +417,7 @@ mod tests {
             &probed,
             &empty_state(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
             fixed_uuid(),
             fixed_time(),
             false,
@@ -403,6 +437,7 @@ mod tests {
             &declared,
             &probed_minimal(),
             &empty_state(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             fixed_uuid(),
             fixed_time(),
@@ -445,6 +480,7 @@ mod tests {
             &probed,
             &empty_state(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
             fixed_uuid(),
             fixed_time(),
             false,
@@ -467,6 +503,7 @@ mod tests {
             &declared_minimal(),
             &probed,
             &empty_state(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             fixed_uuid(),
             fixed_time(),
@@ -515,6 +552,7 @@ mod tests {
             &probed,
             &empty_state(),
             &sha,
+            &BTreeMap::new(),
             fixed_uuid(),
             fixed_time(),
             false,
@@ -559,6 +597,7 @@ mod tests {
             &probed,
             &state,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             fixed_uuid(),
             fixed_time(),
             false,
@@ -589,6 +628,7 @@ mod tests {
             &declared_minimal(),
             &probed,
             &state,
+            &BTreeMap::new(),
             &BTreeMap::new(),
             fixed_uuid(),
             fixed_time(),
@@ -626,6 +666,7 @@ mod tests {
             &probed,
             &state,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             fixed_uuid(),
             fixed_time(),
             true,
@@ -649,6 +690,7 @@ mod tests {
             &probed_minimal(),
             &empty_state(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
             fixed_uuid(),
             fixed_time(),
             true,
@@ -656,6 +698,87 @@ mod tests {
         assert!(
             p.actions.is_empty(),
             "no forgotten ⇒ no actions even with prune"
+        );
+    }
+
+    #[test]
+    fn declared_user_with_hm_enabled_emits_user_env_switch() {
+        use pearlite_schema::{HomeManagerDecl, HomeManagerMode, UserDecl};
+        let mut declared = declared_minimal();
+        declared.users = vec![UserDecl {
+            name: "alice".to_owned(),
+            shell: "/usr/bin/nu".to_owned(),
+            groups: vec![],
+            home_manager: Some(HomeManagerDecl {
+                enabled: true,
+                mode: HomeManagerMode::Standalone,
+                config_path: "users/alice".to_owned(),
+                channel: "release-24.11".to_owned(),
+            }),
+        }];
+
+        let p = plan(
+            &declared,
+            &probed_minimal(),
+            &empty_state(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            fixed_uuid(),
+            fixed_time(),
+            false,
+        );
+
+        let switches: Vec<&Action> = p
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::UserEnvSwitch { .. }))
+            .collect();
+        assert_eq!(switches.len(), 1);
+        if let Action::UserEnvSwitch {
+            user,
+            mode,
+            channel,
+            ..
+        } = switches[0]
+        {
+            assert_eq!(user, "alice");
+            assert_eq!(*mode, HomeManagerMode::Standalone);
+            assert_eq!(channel, "release-24.11");
+        }
+    }
+
+    #[test]
+    fn user_with_disabled_hm_emits_no_action() {
+        use pearlite_schema::{HomeManagerDecl, HomeManagerMode, UserDecl};
+        let mut declared = declared_minimal();
+        declared.users = vec![UserDecl {
+            name: "alice".to_owned(),
+            shell: "/usr/bin/nu".to_owned(),
+            groups: vec![],
+            home_manager: Some(HomeManagerDecl {
+                enabled: false,
+                mode: HomeManagerMode::Standalone,
+                config_path: "users/alice".to_owned(),
+                channel: "release-24.11".to_owned(),
+            }),
+        }];
+
+        let p = plan(
+            &declared,
+            &probed_minimal(),
+            &empty_state(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            fixed_uuid(),
+            fixed_time(),
+            false,
+        );
+
+        assert!(
+            !p.actions
+                .iter()
+                .any(|a| matches!(a, Action::UserEnvSwitch { .. })),
+            "disabled HM must not emit a switch"
         );
     }
 
@@ -676,6 +799,7 @@ mod tests {
                 &probed_minimal(),
                 &empty_state(),
                 &BTreeMap::new(),
+                &BTreeMap::new(),
                 fixed_uuid(),
                 fixed_time(),
                 false,
@@ -684,6 +808,7 @@ mod tests {
                 &declared,
                 &probed_minimal(),
                 &empty_state(),
+                &BTreeMap::new(),
                 &BTreeMap::new(),
                 fixed_uuid(),
                 fixed_time(),
