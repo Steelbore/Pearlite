@@ -350,6 +350,7 @@ mod tests {
             users: Vec::new(),
             remove: pearlite_schema::RemovePolicy::default(),
             snapshots: pearlite_schema::SnapshotPolicy::default(),
+            nix: None,
         }
     }
 

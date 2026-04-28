@@ -35,6 +35,10 @@ impl ContractViolation {
     /// `meta.arch_level` does not match the declared per-feature-level
     /// repository: e.g. `arch_level = "v3"` with non-empty `packages.cachyos-v4`.
     pub const ARCH_LEVEL_MISMATCH: &'static str = "ARCH_LEVEL_MISMATCH";
+    /// At least one user has `home_manager.enabled = true` but the
+    /// `nix.installer.expected_sha256` pin is missing or malformed
+    /// (must be 64 lowercase hex chars). See ADR-0012.
+    pub const NIX_INSTALLER_REQUIRED: &'static str = "NIX_INSTALLER_REQUIRED";
 }
 
 impl std::fmt::Display for ContractViolation {
