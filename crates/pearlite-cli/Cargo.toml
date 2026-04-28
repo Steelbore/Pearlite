@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 pearlite-cargo = { path = "../pearlite-cargo", version = "0.1" }
+pearlite-diff = { path = "../pearlite-diff", version = "0.1" }
 pearlite-engine = { path = "../pearlite-engine", version = "0.1" }
 pearlite-nickel = { path = "../pearlite-nickel", version = "0.1" }
 pearlite-pacman = { path = "../pearlite-pacman", version = "0.1" }
@@ -28,8 +29,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
-# pearlite-diff / pearlite-schema / schemars / thiserror / uuid arrive
-# in M2+ when the apply path and per-provider schema rendering need them.
+# pearlite-schema / schemars / thiserror arrive in M5 when per-provider
+# schema rendering needs them.
 
 [dev-dependencies]
 pearlite-cargo = { path = "../pearlite-cargo", version = "0.1", features = ["test-mocks"] }

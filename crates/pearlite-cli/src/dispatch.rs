@@ -94,6 +94,7 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
             host_file,
             snapper_config,
             failures_dir,
+            plans_dir,
             dry_run,
         } => dispatch_apply(
             args,
@@ -101,6 +102,7 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
             host_file.as_ref(),
             snapper_config,
             failures_dir.as_ref(),
+            plans_dir.as_ref(),
             *dry_run,
             &metadata_at,
         ),
@@ -147,6 +149,7 @@ fn dispatch_apply(
     host_file: Option<&PathBuf>,
     snapper_config: &str,
     failures_dir: Option<&PathBuf>,
+    plans_dir: Option<&PathBuf>,
     dry_run: bool,
     metadata_at: &dyn Fn(Option<String>) -> Metadata,
 ) -> Envelope {
@@ -156,6 +159,9 @@ fn dispatch_apply(
     let failures_dir = failures_dir
         .cloned()
         .unwrap_or_else(|| default_failures_dir(&ctx.state_path));
+    let plans_dir = plans_dir
+        .cloned()
+        .unwrap_or_else(|| default_plans_dir(&ctx.state_path));
     let state = match read_state_strict(&ctx.state_path) {
         Ok(s) => s,
         Err(payload) => return Envelope::failure(metadata_at(None), payload),
@@ -166,6 +172,12 @@ fn dispatch_apply(
     };
     let host = plan.host.clone();
     let plan_id = plan.plan_id;
+    // Persist the plan before any side effects. Best-effort: the
+    // `[[history]]` entry that `apply_plan` writes already carries the
+    // plan_id, so a missing JSON file does not break the apply or any
+    // future `gen show` lookup. PRD §11 still expects the file to
+    // exist for richer per-action forensics, hence the write.
+    persist_plan(&plan, &plans_dir);
     if dry_run {
         return match serde_json::to_value(&plan) {
             Ok(v) => Envelope::success(metadata_at(Some(host)), v),
@@ -197,6 +209,32 @@ fn dispatch_apply(
             metadata_at(Some(host)),
             apply_error_payload(&e, &ctx.state_path, plan_id),
         ),
+    }
+}
+
+/// Default plans directory: `<state_file dir>/plans`.
+///
+/// Mirrors [`default_failures_dir`]: on a production install with
+/// `state_file` = `/var/lib/pearlite/state.toml`, this resolves to
+/// `/var/lib/pearlite/plans`.
+fn default_plans_dir(state_path: &Path) -> PathBuf {
+    state_path
+        .parent()
+        .unwrap_or(Path::new("/var/lib/pearlite"))
+        .join("plans")
+}
+
+/// Best-effort persist `plan` to `<plans_dir>/<plan-id>.json`.
+///
+/// Errors are intentionally swallowed: the apply still proceeds, and
+/// the `[[history]]` entry carries `plan_id` regardless. The JSON file
+/// is a forensic convenience for `gen show` and future `--plan-file`
+/// consumers, not an apply prerequisite.
+fn persist_plan(plan: &pearlite_diff::Plan, plans_dir: &Path) {
+    let _ = std::fs::create_dir_all(plans_dir);
+    let path = plans_dir.join(format!("{}.json", plan.plan_id.simple()));
+    if let Ok(json) = serde_json::to_vec_pretty(plan) {
+        let _ = std::fs::write(path, json);
     }
 }
 
@@ -766,6 +804,7 @@ package = "linux-cachyos"
                 host_file: Some(host_file),
                 snapper_config: "root".to_owned(),
                 failures_dir: None,
+                plans_dir: None,
                 dry_run: false,
             },
         }
@@ -780,6 +819,7 @@ package = "linux-cachyos"
                 host_file: Some(host_file),
                 snapper_config: "root".to_owned(),
                 failures_dir: None,
+                plans_dir: None,
                 dry_run: true,
             },
         }
@@ -985,6 +1025,71 @@ package = "linux-cachyos"
         // when actions_executed == 0.
         let p = default_failures_dir(Path::new("/var/lib/pearlite/state.toml"));
         assert_eq!(p, PathBuf::from("/var/lib/pearlite/failures"));
+    }
+
+    #[test]
+    fn apply_default_plans_dir_is_state_sibling() {
+        let p = default_plans_dir(Path::new("/var/lib/pearlite/state.toml"));
+        assert_eq!(p, PathBuf::from("/var/lib/pearlite/plans"));
+    }
+
+    #[test]
+    fn apply_persists_plan_json_to_default_plans_dir() {
+        let dir = TempDir::new().expect("tempdir");
+        let host = dir.path().join("forge.ncl");
+        let state_path = dir.path().join("state.toml");
+        write_baseline_state(&state_path);
+        let ctx = ctx_with(host.clone(), MINIMAL_HOST, state_path.clone());
+        let env = dispatch(&args_for_apply(host, state_path.clone()), &ctx);
+
+        assert!(env.error.is_none(), "expected success, got {env:?}");
+        let data = env.data.expect("data");
+        let plan_id = data
+            .get("plan_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("plan_id")
+            .to_owned();
+
+        // Plan JSON sits at <state_dir>/plans/<plan-id>.json (with
+        // hyphens stripped; uuid::Uuid::simple format).
+        let plan_id_uuid: uuid::Uuid = plan_id.parse().expect("uuid parse");
+        let plans_dir = state_path.parent().expect("parent").join("plans");
+        let plan_path = plans_dir.join(format!("{}.json", plan_id_uuid.simple()));
+        assert!(
+            plan_path.exists(),
+            "plan JSON must land at {}",
+            plan_path.display()
+        );
+
+        // Round-trip: the file deserialises into a Plan whose plan_id
+        // matches the apply outcome's plan_id.
+        let raw = std::fs::read(&plan_path).expect("read plan json");
+        let parsed: pearlite_diff::Plan = serde_json::from_slice(&raw).expect("parse plan");
+        assert_eq!(parsed.plan_id, plan_id_uuid);
+    }
+
+    #[test]
+    fn apply_dry_run_also_persists_plan_json() {
+        let dir = TempDir::new().expect("tempdir");
+        let host = dir.path().join("forge.ncl");
+        let state_path = dir.path().join("state.toml");
+        write_baseline_state(&state_path);
+        let ctx = ctx_with(host.clone(), MINIMAL_HOST, state_path.clone());
+        let env = dispatch(&args_for_apply_dry_run(host, state_path.clone()), &ctx);
+
+        assert!(env.error.is_none(), "expected success, got {env:?}");
+        let data = env.data.expect("data");
+        let plan_id_str = data
+            .get("plan_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("plan_id");
+        let plan_id_uuid: uuid::Uuid = plan_id_str.parse().expect("uuid parse");
+        let plans_dir = state_path.parent().expect("parent").join("plans");
+        let plan_path = plans_dir.join(format!("{}.json", plan_id_uuid.simple()));
+        assert!(
+            plan_path.exists(),
+            "dry-run must still persist the plan JSON for forensics"
+        );
     }
 
     /// Pre-seed `state_path` with a `[[history]]` entry referencing

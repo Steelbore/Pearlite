@@ -463,6 +463,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "pearlite-cargo",
+ "pearlite-diff",
  "pearlite-engine",
  "pearlite-nickel",
  "pearlite-pacman",
