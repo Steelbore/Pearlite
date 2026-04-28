@@ -111,6 +111,14 @@ pub enum Action {
         mode: HomeManagerMode,
         /// Channel/refspec for HM (e.g. `release-24.11`).
         channel: String,
+        /// Hex-encoded SHA-256 of the user's `config_path` directory
+        /// at plan time. Recorded into `state.toml`'s
+        /// `[[managed.user_env]]` after the switch succeeds so the
+        /// next `pearlite plan` can detect drift via a hash compare.
+        /// Empty when the engine couldn't compute one (defensive
+        /// arm in `classify_user_env`); the apply path still records
+        /// it but the next plan will recompute and re-apply.
+        config_hash: String,
     },
     /// Take a Snapper snapshot.
     SnapshotCreate {

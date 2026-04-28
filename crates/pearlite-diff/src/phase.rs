@@ -212,6 +212,7 @@ mod tests {
             config_path: PathBuf::from("/repo/users/alice"),
             mode: pearlite_schema::HomeManagerMode::Standalone,
             channel: "release-24.11".to_owned(),
+            config_hash: String::new(),
         };
         assert_eq!(a.phase(), ApplyPhase::UserEnv);
     }

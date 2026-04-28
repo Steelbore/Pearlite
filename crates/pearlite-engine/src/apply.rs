@@ -30,7 +30,7 @@ use pearlite_cargo::Cargo;
 use pearlite_diff::{Action, ApplyPhase, FailureCoherence, Plan, Scope};
 use pearlite_pacman::Pacman;
 use pearlite_snapper::{Snapper, SnapshotInfo};
-use pearlite_state::{FailureRef, HistoryEntry, SnapshotRef, StateStore};
+use pearlite_state::{FailureRef, HistoryEntry, SnapshotRef, StateStore, UserEnvRecord};
 use pearlite_systemd::{Scope as SystemdScope, Systemd};
 use pearlite_userenv::HomeManagerBackend;
 use serde::{Deserialize, Serialize};
@@ -146,6 +146,7 @@ impl Engine {
 
         let mut actions_executed = 0usize;
         let mut failure: Option<(usize, Action, ApplyError)> = None;
+        let mut user_env_records: Vec<UserEnvRecord> = Vec::new();
         'phases: for phase in [
             ApplyPhase::Removals,
             ApplyPhase::Installs,
@@ -163,6 +164,7 @@ impl Engine {
                         systemd,
                         home_manager,
                         self.repo_root(),
+                        &mut user_env_records,
                     ) {
                         failure = Some((actions_executed, (*action).clone(), e));
                         break 'phases;
@@ -193,6 +195,7 @@ impl Engine {
         // the last file written on apply.
         let store = StateStore::new(state_path.to_path_buf());
         let mut state = store.read()?;
+        upsert_user_env_records(&mut state, user_env_records);
         let generation = next_generation(&state);
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let summary = summarize(&plan.actions);
@@ -296,6 +299,26 @@ fn post_fail_label(plan_id: Uuid) -> String {
     format!("post-fail-pearlite-apply-{}", short_id(plan_id))
 }
 
+/// Merge fresh per-user [`UserEnvRecord`]s into `state.managed.user_env`,
+/// replacing any existing record for the same login name and pushing
+/// the rest. Order is "last write wins" — if the apply executed two
+/// switches for the same user (which shouldn't happen since
+/// `within_phase_key` deduplicates by user, but the data structure
+/// allows it), the later write is what survives.
+fn upsert_user_env_records(state: &mut pearlite_state::State, fresh: Vec<UserEnvRecord>) {
+    for record in fresh {
+        match state
+            .managed
+            .user_env
+            .iter_mut()
+            .find(|r| r.user == record.user)
+        {
+            Some(existing) => *existing = record,
+            None => state.managed.user_env.push(record),
+        }
+    }
+}
+
 fn next_generation(state: &pearlite_state::State) -> u64 {
     state
         .history
@@ -370,6 +393,7 @@ fn exec_action(
     systemd: &dyn Systemd,
     home_manager: &dyn HomeManagerBackend,
     repo_root: &Path,
+    user_env_records: &mut Vec<UserEnvRecord>,
 ) -> Result<(), ApplyError> {
     match action {
         Action::PacmanInstall { repo, packages } => {
@@ -426,8 +450,14 @@ fn exec_action(
             config_path,
             mode,
             channel,
+            config_hash,
         } => {
-            home_manager.switch(user, config_path, *mode, channel)?;
+            let outcome = home_manager.switch(user, config_path, *mode, channel)?;
+            user_env_records.push(UserEnvRecord {
+                user: outcome.user,
+                generation: outcome.generation,
+                config_hash: config_hash.clone(),
+            });
         }
         // `SnapshotCreate` actions in plans are state-history records,
         // not orchestration steps. The pre/post snapshot bookkeeping
@@ -874,12 +904,14 @@ mod tests {
                         config_path: PathBuf::from("/repo/users/alice"),
                         mode: pearlite_schema::HomeManagerMode::Standalone,
                         channel: "release-24.11".to_owned(),
+                        config_hash: "alicehash".to_owned(),
                     },
                     Action::UserEnvSwitch {
                         user: "bob".to_owned(),
                         config_path: PathBuf::from("/repo/users/bob"),
                         mode: pearlite_schema::HomeManagerMode::Flake,
                         channel: "default".to_owned(),
+                        config_hash: "bobhash".to_owned(),
                     },
                 ]),
                 &pacman,
@@ -902,6 +934,96 @@ mod tests {
         assert_eq!(hist[0].mode, pearlite_schema::HomeManagerMode::Standalone);
         assert_eq!(hist[1].user, "bob");
         assert_eq!(hist[1].mode, pearlite_schema::HomeManagerMode::Flake);
+
+        // state.toml's managed.user_env grew two records — one per
+        // dispatched switch. Generation comes from MockHmBackend's
+        // monotonic counter; config_hash echoes the action's payload.
+        let read_back = StateStore::new(state_path).read().expect("read state");
+        assert_eq!(read_back.managed.user_env.len(), 2);
+        let alice = read_back
+            .managed
+            .user_env
+            .iter()
+            .find(|r| r.user == "alice")
+            .expect("alice record");
+        assert_eq!(alice.config_hash, "alicehash");
+        assert!(alice.generation >= 1);
+        let bob = read_back
+            .managed
+            .user_env
+            .iter()
+            .find(|r| r.user == "bob")
+            .expect("bob record");
+        assert_eq!(bob.config_hash, "bobhash");
+        assert_ne!(
+            alice.generation, bob.generation,
+            "monotonic mock generation"
+        );
+    }
+
+    #[test]
+    fn user_env_record_upserts_on_re_apply() {
+        // First apply records (alice, gen=1, hash="v1"). Second apply
+        // with a different hash replaces — does NOT append a second
+        // entry — so managed.user_env stays one record per user.
+        let pacman = MockPacman::new();
+        let cargo = MockCargo::new();
+        let systemd = MockSystemd::new();
+        let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let (state_path, failures_dir) = setup_state(&state_dir);
+
+        engine()
+            .apply_plan(
+                &plan_with_actions(vec![Action::UserEnvSwitch {
+                    user: "alice".to_owned(),
+                    config_path: PathBuf::from("/repo/users/alice"),
+                    mode: pearlite_schema::HomeManagerMode::Standalone,
+                    channel: "release-24.11".to_owned(),
+                    config_hash: "v1".to_owned(),
+                }]),
+                &pacman,
+                &cargo,
+                &systemd,
+                &snapper,
+                &home_manager,
+                "root",
+                &state_path,
+                &failures_dir,
+            )
+            .expect("first apply");
+
+        engine()
+            .apply_plan(
+                &plan_with_actions(vec![Action::UserEnvSwitch {
+                    user: "alice".to_owned(),
+                    config_path: PathBuf::from("/repo/users/alice"),
+                    mode: pearlite_schema::HomeManagerMode::Standalone,
+                    channel: "release-24.11".to_owned(),
+                    config_hash: "v2".to_owned(),
+                }]),
+                &pacman,
+                &cargo,
+                &systemd,
+                &snapper,
+                &home_manager,
+                "root",
+                &state_path,
+                &failures_dir,
+            )
+            .expect("second apply");
+
+        let read_back = StateStore::new(state_path).read().expect("read state");
+        assert_eq!(
+            read_back.managed.user_env.len(),
+            1,
+            "managed.user_env must upsert by user, not append"
+        );
+        assert_eq!(read_back.managed.user_env[0].user, "alice");
+        assert_eq!(read_back.managed.user_env[0].config_hash, "v2");
+        // Mock's generation counter is monotonic across the two switches.
+        assert_eq!(read_back.managed.user_env[0].generation, 2);
     }
 
     #[test]
@@ -934,6 +1056,7 @@ mod tests {
                     config_path: PathBuf::from("/repo/users/alice"),
                     mode: pearlite_schema::HomeManagerMode::Standalone,
                     channel: "release-24.11".to_owned(),
+                    config_hash: "h".to_owned(),
                 }]),
                 &pacman,
                 &cargo,
