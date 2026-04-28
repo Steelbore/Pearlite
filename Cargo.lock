@@ -589,6 +589,12 @@ dependencies = [
 [[package]]
 name = "pearlite-userenv"
 version = "0.1.0"
+dependencies = [
+ "pearlite-schema",
+ "schemars",
+ "serde",
+ "thiserror",
+]
 
 [[package]]
 name = "powerfmt"
