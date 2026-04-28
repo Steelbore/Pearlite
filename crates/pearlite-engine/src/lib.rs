@@ -13,7 +13,7 @@ mod plan;
 mod probe;
 mod rollback;
 
-pub use apply::{ApplyOutcome, FailureRecord};
+pub use apply::{ApplyContext, ApplyOutcome, FailureRecord};
 pub use errors::{ApplyError, EngineError, ProbeError, RollbackError};
 pub use plan::Engine;
 pub use probe::{LiveProbe, SystemProbe};

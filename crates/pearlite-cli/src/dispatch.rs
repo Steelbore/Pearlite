@@ -257,17 +257,17 @@ fn dispatch_apply(
             ),
         };
     }
-    match ctx.engine.apply_plan(
-        &plan,
-        ctx.pacman.as_ref(),
-        ctx.cargo.as_ref(),
-        ctx.systemd.as_ref(),
-        ctx.snapper.as_ref(),
-        ctx.home_manager.as_ref(),
-        opts.snapper_config,
-        &ctx.state_path,
-        &failures_dir,
-    ) {
+    let apply_ctx = pearlite_engine::ApplyContext {
+        pacman: ctx.pacman.as_ref(),
+        cargo: ctx.cargo.as_ref(),
+        systemd: ctx.systemd.as_ref(),
+        snapper: ctx.snapper.as_ref(),
+        home_manager: ctx.home_manager.as_ref(),
+        snapper_config: opts.snapper_config,
+        state_path: &ctx.state_path,
+        failures_dir: &failures_dir,
+    };
+    match ctx.engine.apply_plan(&plan, &apply_ctx) {
         Ok(outcome) => Envelope::success(metadata_at(Some(host)), apply_outcome_view(&outcome)),
         Err(e) => Envelope::failure(
             metadata_at(Some(host)),
