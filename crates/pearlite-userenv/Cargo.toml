@@ -15,7 +15,11 @@ workspace = true
 test-mocks = []
 
 [dependencies]
+pearlite-fs = { path = "../pearlite-fs", version = "0.1" }
 pearlite-schema = { path = "../pearlite-schema", version = "0.1" }
 schemars = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
