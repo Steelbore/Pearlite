@@ -590,9 +590,11 @@ dependencies = [
 name = "pearlite-userenv"
 version = "0.1.0"
 dependencies = [
+ "pearlite-fs",
  "pearlite-schema",
  "schemars",
  "serde",
+ "tempfile",
  "thiserror",
 ]
 

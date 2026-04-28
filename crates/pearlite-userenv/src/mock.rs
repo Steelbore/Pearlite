@@ -8,7 +8,8 @@
 
 //! In-memory [`MockHmBackend`] for engine integration tests.
 
-use crate::errors::UserenvError;
+use crate::errors::{InstallerError, UserenvError};
+use crate::installer::{InstallOutcome, NixInstaller};
 use crate::live::{HomeManagerBackend, UserEnvOutcome};
 use pearlite_schema::HomeManagerMode;
 use std::path::{Path, PathBuf};
@@ -117,6 +118,95 @@ impl HomeManagerBackend for MockHmBackend {
     }
 }
 
+/// One recorded `install_if_missing` invocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallInvocation {
+    /// `script_path` argument.
+    pub script_path: PathBuf,
+    /// `expected_sha256` argument.
+    pub expected_sha256: String,
+    /// `installer_args` argument, owned for inspection.
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct InstallerState {
+    history: Vec<InstallInvocation>,
+    /// When `true`, every call returns `Already` without inspecting
+    /// `script_path` / `expected_sha256`. Default `false` (i.e.
+    /// `Installed`).
+    already: bool,
+}
+
+/// In-memory [`NixInstaller`] that records every call and lets the
+/// test choose the outcome.
+#[derive(Clone, Debug, Default)]
+pub struct MockNixInstaller {
+    state: Arc<Mutex<InstallerState>>,
+}
+
+impl MockNixInstaller {
+    /// Construct a fresh [`MockNixInstaller`] reporting `Installed`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct a [`MockNixInstaller`] that reports `Already` for
+    /// every call (the "nix is already on PATH" path).
+    #[must_use]
+    pub fn with_already_installed() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(InstallerState {
+                history: Vec::new(),
+                already: true,
+            })),
+        }
+    }
+
+    /// Snapshot the recorded install history.
+    #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "test utility — mutex-poison panic is unreachable"
+    )]
+    pub fn install_history(&self) -> Vec<InstallInvocation> {
+        self.state
+            .lock()
+            .expect("MockNixInstaller mutex must not be poisoned")
+            .history
+            .clone()
+    }
+}
+
+impl NixInstaller for MockNixInstaller {
+    #[allow(
+        clippy::expect_used,
+        reason = "test utility — mutex-poison panic is unreachable"
+    )]
+    fn install_if_missing(
+        &self,
+        script_path: &Path,
+        expected_sha256: &str,
+        installer_args: &[&str],
+    ) -> Result<InstallOutcome, InstallerError> {
+        let mut s = self
+            .state
+            .lock()
+            .expect("MockNixInstaller mutex must not be poisoned");
+        s.history.push(InstallInvocation {
+            script_path: script_path.to_path_buf(),
+            expected_sha256: expected_sha256.to_owned(),
+            args: installer_args.iter().map(|a| (*a).to_owned()).collect(),
+        });
+        Ok(if s.already {
+            InstallOutcome::Already
+        } else {
+            InstallOutcome::Installed
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -155,6 +245,38 @@ mod tests {
         assert_eq!(hist[0].mode, HomeManagerMode::Standalone);
         assert_eq!(hist[1].user, "bob");
         assert_eq!(hist[1].mode, HomeManagerMode::Flake);
+    }
+
+    #[test]
+    fn mock_installer_install_records_call_and_reports_installed() {
+        let m = MockNixInstaller::new();
+        let outcome = m
+            .install_if_missing(
+                Path::new("/tmp/installer.sh"),
+                "deadbeef",
+                &["install", "--determinate"],
+            )
+            .expect("install");
+        assert_eq!(outcome, InstallOutcome::Installed);
+        let hist = m.install_history();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].script_path, PathBuf::from("/tmp/installer.sh"));
+        assert_eq!(hist[0].expected_sha256, "deadbeef");
+        assert_eq!(
+            hist[0].args,
+            vec!["install".to_owned(), "--determinate".to_owned()]
+        );
+    }
+
+    #[test]
+    fn mock_installer_already_installed_short_circuits() {
+        let m = MockNixInstaller::with_already_installed();
+        let outcome = m
+            .install_if_missing(Path::new("/x"), "x", &[])
+            .expect("install");
+        assert_eq!(outcome, InstallOutcome::Already);
+        // history still records the call so tests can assert it ran.
+        assert_eq!(m.install_history().len(), 1);
     }
 
     #[test]

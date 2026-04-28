@@ -15,12 +15,14 @@
 //! orchestrator will consume.
 
 mod errors;
+mod installer;
 mod live;
 #[cfg(any(test, feature = "test-mocks"))]
 mod mock;
 
-pub use errors::UserenvError;
+pub use errors::{InstallerError, UserenvError};
+pub use installer::{InstallOutcome, LiveNixInstaller, NixInstaller};
 pub use live::{HomeManagerBackend, LiveHmBackend, UserEnvOutcome, parse_generation_from_switch};
 
 #[cfg(feature = "test-mocks")]
-pub use mock::{MockHmBackend, SwitchInvocation};
+pub use mock::{InstallInvocation, MockHmBackend, MockNixInstaller, SwitchInvocation};
