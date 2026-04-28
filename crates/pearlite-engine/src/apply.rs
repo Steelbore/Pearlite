@@ -71,6 +71,37 @@ pub struct FailureRecord {
     pub snapshot_pre: SnapshotRef,
 }
 
+/// Bundle of system adapters, paths, and configuration consumed by
+/// [`Engine::apply_plan`].
+///
+/// Refactored from the prior 9-positional signature; future apply-time
+/// extensions add fields here rather than growing the call surface.
+/// All fields are borrows; an `ApplyContext` outlives the borrowed
+/// adapters and lives only for the duration of one apply call.
+pub struct ApplyContext<'a> {
+    /// Pacman / paru adapter for repo and AUR installs, removals, and
+    /// db sync.
+    pub pacman: &'a dyn Pacman,
+    /// Cargo adapter for `cargo install` / `cargo uninstall`.
+    pub cargo: &'a dyn Cargo,
+    /// Systemd adapter for service `enable` / `disable` / `mask` /
+    /// `restart`.
+    pub systemd: &'a dyn Systemd,
+    /// Snapper adapter for pre / post / post-fail snapshots.
+    pub snapper: &'a dyn Snapper,
+    /// Home Manager backend for phase-7 user-env switches.
+    pub home_manager: &'a dyn HomeManagerBackend,
+    /// Snapper config name to take snapshots against (typically
+    /// `"root"`).
+    pub snapper_config: &'a str,
+    /// Absolute path to `state.toml`; must already exist (initial
+    /// creation is `pearlite init`).
+    pub state_path: &'a Path,
+    /// Directory where `<plan-id>.json` failure records land — created
+    /// if missing.
+    pub failures_dir: &'a Path,
+}
+
 /// Outcome of a successful [`Engine::apply_plan`] run.
 #[derive(Clone, Debug)]
 pub struct ApplyOutcome {
@@ -99,11 +130,9 @@ impl Engine {
     /// last write per CLAUDE.md hard invariant 8). Halts on the first
     /// error.
     ///
-    /// `snapper_config` is the snapper config name to take snapshots
-    /// against (typically `"root"`). `state_path` is the absolute path
-    /// to `state.toml`; it must already exist (initial creation is
-    /// `pearlite init`). `failures_dir` is the directory where failure
-    /// JSON records land — created if missing.
+    /// All system-side wiring (adapters, snapper config name, state
+    /// path, failures directory) is bundled in the [`ApplyContext`]
+    /// borrow.
     ///
     /// # Errors
     /// Returns [`ApplyError`] wrapping the failing adapter's error.
@@ -116,32 +145,21 @@ impl Engine {
     /// appends a [`FailureRef`] to `state.toml`. These side effects
     /// are best-effort: a record-writing failure does not mask the
     /// underlying [`ApplyError`].
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "apply_plan is the orchestrator entry point; passing all five \
-                  trait-object adapters + plan + state path + failures dir is the \
-                  natural surface, and a builder hides too much of what's load-bearing"
-    )]
     pub fn apply_plan(
         &self,
         plan: &Plan,
-        pacman: &dyn Pacman,
-        cargo: &dyn Cargo,
-        systemd: &dyn Systemd,
-        snapper: &dyn Snapper,
-        home_manager: &dyn HomeManagerBackend,
-        snapper_config: &str,
-        state_path: &Path,
-        failures_dir: &Path,
+        ctx: &ApplyContext<'_>,
     ) -> Result<ApplyOutcome, ApplyError> {
         let started = Instant::now();
 
-        let snapshot_pre = snapper.create(snapper_config, &pre_label(plan.plan_id))?;
+        let snapshot_pre = ctx
+            .snapper
+            .create(ctx.snapper_config, &pre_label(plan.plan_id))?;
 
         let buckets = partition_by_phase(&plan.actions);
 
         if needs_db_sync(plan) {
-            pacman.sync_databases()?;
+            ctx.pacman.sync_databases()?;
         }
 
         let mut actions_executed = 0usize;
@@ -159,10 +177,10 @@ impl Engine {
                 for action in actions {
                     if let Err(e) = exec_action(
                         action,
-                        pacman,
-                        cargo,
-                        systemd,
-                        home_manager,
+                        ctx.pacman,
+                        ctx.cargo,
+                        ctx.systemd,
+                        ctx.home_manager,
                         self.repo_root(),
                         &mut user_env_records,
                     ) {
@@ -175,25 +193,17 @@ impl Engine {
         }
 
         if let Some((idx, failed_action, err)) = failure {
-            record_apply_failure(
-                plan,
-                idx,
-                failed_action,
-                &err,
-                snapper,
-                snapper_config,
-                &snapshot_pre,
-                state_path,
-                failures_dir,
-            );
+            record_apply_failure(plan, idx, failed_action, &err, &snapshot_pre, ctx);
             return Err(err);
         }
 
-        let snapshot_post = snapper.create(snapper_config, &post_label(plan.plan_id))?;
+        let snapshot_post = ctx
+            .snapper
+            .create(ctx.snapper_config, &post_label(plan.plan_id))?;
 
         // Phase 9 — state.toml commit. PRD §8.2 invariant 8: this is
         // the last file written on apply.
-        let store = StateStore::new(state_path.to_path_buf());
+        let store = StateStore::new(ctx.state_path.to_path_buf());
         let mut state = store.read()?;
         upsert_user_env_records(&mut state, user_env_records);
         let generation = next_generation(&state);
@@ -240,21 +250,13 @@ impl Engine {
 /// Errors are intentionally swallowed: the apply has already failed,
 /// and a failed-record-write (or stale state.toml) is a secondary
 /// concern. The caller still sees the original [`ApplyError`].
-#[allow(
-    clippy::too_many_arguments,
-    reason = "record_apply_failure mirrors apply_plan's parameter set; \
-              the fields are all load-bearing for the forensic record"
-)]
 fn record_apply_failure(
     plan: &Plan,
     executed_index: usize,
     failed_action: Action,
     err: &ApplyError,
-    snapper: &dyn Snapper,
-    snapper_config: &str,
     snapshot_pre: &SnapshotInfo,
-    state_path: &Path,
-    failures_dir: &Path,
+    ctx: &ApplyContext<'_>,
 ) {
     let class = match failed_action.failure_coherence() {
         FailureCoherence::Recoverable => 3u8,
@@ -262,8 +264,9 @@ fn record_apply_failure(
     };
     let exit_code = if class == 3 { 4u8 } else { 5u8 };
 
-    let post_fail_snapshot = snapper
-        .create(snapper_config, &post_fail_label(plan.plan_id))
+    let post_fail_snapshot = ctx
+        .snapper
+        .create(ctx.snapper_config, &post_fail_label(plan.plan_id))
         .ok();
 
     let record = FailureRecord {
@@ -278,8 +281,10 @@ fn record_apply_failure(
         snapshot_pre: to_snapshot_ref(snapshot_pre),
     };
 
-    let record_path = failures_dir.join(format!("{}.json", plan.plan_id.simple()));
-    let _ = std::fs::create_dir_all(failures_dir);
+    let record_path = ctx
+        .failures_dir
+        .join(format!("{}.json", plan.plan_id.simple()));
+    let _ = std::fs::create_dir_all(ctx.failures_dir);
     if let Ok(json) = serde_json::to_vec_pretty(&record) {
         let _ = std::fs::write(&record_path, &json);
     }
@@ -291,7 +296,7 @@ fn record_apply_failure(
         exit_code,
         record_path,
     };
-    let store = StateStore::new(state_path.to_path_buf());
+    let store = StateStore::new(ctx.state_path.to_path_buf());
     let _ = store.append_failure(failure_ref);
 }
 
@@ -575,6 +580,30 @@ mod tests {
         )
     }
 
+    /// Build an [`ApplyContext`] from the per-test mock adapters and
+    /// state paths. Tests universally use `snapper_config = "root"`,
+    /// so the helper hard-codes it.
+    fn make_ctx<'a>(
+        pacman: &'a MockPacman,
+        cargo: &'a MockCargo,
+        systemd: &'a MockSystemd,
+        snapper: &'a MockSnapper,
+        home_manager: &'a MockHmBackend,
+        state_path: &'a Path,
+        failures_dir: &'a Path,
+    ) -> ApplyContext<'a> {
+        ApplyContext {
+            pacman,
+            cargo,
+            systemd,
+            snapper,
+            home_manager,
+            snapper_config: "root",
+            state_path,
+            failures_dir,
+        }
+    }
+
     fn plan_with_actions(actions: Vec<Action>) -> DiffPlan {
         DiffPlan {
             plan_id: Uuid::nil(),
@@ -624,14 +653,15 @@ mod tests {
         let out = engine()
             .apply_plan(
                 &plan_with_actions(vec![]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("apply");
 
@@ -669,14 +699,15 @@ mod tests {
                     crate_name: "zellij".to_owned(),
                     locked: true,
                 }]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("apply");
         assert_eq!(pacman.sync_count(), 0, "cargo-only plan must not sync");
@@ -687,14 +718,15 @@ mod tests {
                     repo: "core".to_owned(),
                     packages: vec!["base".to_owned()],
                 }]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("apply");
         assert_eq!(pacman.sync_count(), 1, "pacman install triggers sync");
@@ -722,14 +754,15 @@ mod tests {
                     repo: "extra".to_owned(),
                     packages: vec!["htop".to_owned(), "ripgrep".to_owned()],
                 }]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("apply");
         assert_eq!(
@@ -756,14 +789,15 @@ mod tests {
                 &plan_with_actions(vec![Action::AurInstall {
                     packages: vec!["yay".to_owned()],
                 }]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("apply");
         assert_eq!(pacman.aur_install_history(), vec![vec!["yay".to_owned()]]);
@@ -791,14 +825,15 @@ mod tests {
                         locked: true,
                     },
                 ]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("apply");
         assert_eq!(cargo.uninstall_history(), vec!["old-crate".to_owned()]);
@@ -829,14 +864,15 @@ mod tests {
                         unit: "telnet.service".to_owned(),
                     },
                 ]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("apply");
         assert_eq!(
@@ -865,14 +901,15 @@ mod tests {
                         name: "alice".to_owned(),
                     },
                 }]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("apply");
         assert_eq!(
@@ -914,14 +951,15 @@ mod tests {
                         config_hash: "bobhash".to_owned(),
                     },
                 ]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("apply");
 
@@ -983,14 +1021,15 @@ mod tests {
                     channel: "release-24.11".to_owned(),
                     config_hash: "v1".to_owned(),
                 }]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("first apply");
 
@@ -1003,14 +1042,15 @@ mod tests {
                     channel: "release-24.11".to_owned(),
                     config_hash: "v2".to_owned(),
                 }]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("second apply");
 
@@ -1058,14 +1098,16 @@ mod tests {
                     channel: "release-24.11".to_owned(),
                     config_hash: "h".to_owned(),
                 }]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &FailingHm,
-                "root",
-                &state_path,
-                &failures_dir,
+                &ApplyContext {
+                    pacman: &pacman,
+                    cargo: &cargo,
+                    systemd: &systemd,
+                    snapper: &snapper,
+                    home_manager: &FailingHm,
+                    snapper_config: "root",
+                    state_path: &state_path,
+                    failures_dir: &failures_dir,
+                },
             )
             .expect_err("must fail");
         assert!(matches!(err, ApplyError::Userenv(_)), "got {err:?}");
@@ -1105,14 +1147,15 @@ mod tests {
                         packages: vec!["xterm".to_owned()],
                     },
                 ]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("apply");
 
@@ -1147,14 +1190,15 @@ mod tests {
                         packages: vec!["base".to_owned()],
                     },
                 ]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("apply");
 
@@ -1179,14 +1223,15 @@ mod tests {
                     label: "pre".to_owned(),
                     phase: Phase::Pre,
                 }]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("apply");
         assert_eq!(out.snapshot_pre.id, 1);
@@ -1255,14 +1300,15 @@ mod tests {
                     group,
                     declaration_index: 0,
                 }]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("apply");
 
@@ -1302,14 +1348,15 @@ mod tests {
                     group,
                     declaration_index: 0,
                 }]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect_err("must fail");
         assert!(
@@ -1353,14 +1400,15 @@ mod tests {
                     group,
                     declaration_index: 0,
                 }]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect_err("must fail");
         assert!(matches!(err, ApplyError::Fs(_)), "got {err:?}");
@@ -1402,14 +1450,16 @@ mod tests {
         let err = engine()
             .apply_plan(
                 &plan_with_actions(vec![]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &FailingSnapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &ApplyContext {
+                    pacman: &pacman,
+                    cargo: &cargo,
+                    systemd: &systemd,
+                    snapper: &FailingSnapper,
+                    home_manager: &home_manager,
+                    snapper_config: "root",
+                    state_path: &state_path,
+                    failures_dir: &failures_dir,
+                },
             )
             .expect_err("must fail");
         assert!(matches!(err, ApplyError::Snapper(_)), "got {err:?}");
@@ -1431,14 +1481,15 @@ mod tests {
         let err = engine()
             .apply_plan(
                 &plan_with_actions(vec![]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect_err("must fail");
         assert!(matches!(err, ApplyError::State(_)), "got {err:?}");
@@ -1469,14 +1520,15 @@ mod tests {
                         scope: Scope::System,
                     },
                 ]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect("apply");
 
@@ -1528,14 +1580,15 @@ mod tests {
                     group,
                     declaration_index: 0,
                 }]),
-                &pacman,
-                &cargo,
-                &systemd,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &state_path,
+                    &failures_dir,
+                ),
             )
             .expect_err("must fail");
 
@@ -1599,14 +1652,16 @@ mod tests {
                 &plan_with_actions(vec![Action::ServiceRestart {
                     unit: "sshd.service".to_owned(),
                 }]),
-                &pacman,
-                &cargo,
-                &FailingRestart,
-                &snapper,
-                &home_manager,
-                "root",
-                &state_path,
-                &failures_dir,
+                &ApplyContext {
+                    pacman: &pacman,
+                    cargo: &cargo,
+                    systemd: &FailingRestart,
+                    snapper: &snapper,
+                    home_manager: &home_manager,
+                    snapper_config: "root",
+                    state_path: &state_path,
+                    failures_dir: &failures_dir,
+                },
             )
             .expect_err("must fail");
         assert!(matches!(err, ApplyError::Systemd(_)), "got {err:?}");
