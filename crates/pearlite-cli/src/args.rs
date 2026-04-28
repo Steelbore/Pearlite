@@ -74,6 +74,10 @@ pub enum Command {
         /// `/var/lib/pearlite/failures`).
         #[arg(long)]
         failures_dir: Option<PathBuf>,
+        /// Plan but don't execute. Returns the same envelope shape as
+        /// `pearlite plan`.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Inspect Pearlite's apply history (a.k.a. generations).
     ///
