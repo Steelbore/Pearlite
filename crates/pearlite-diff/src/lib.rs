@@ -20,7 +20,8 @@ mod plan;
 pub use action::{Action, Phase, Scope};
 pub use classify::{
     CargoClassification, ConfigClassification, ConfigFileDrift, PacmanClassification,
-    ServicesClassification, classify_cargo, classify_config, classify_pacman, classify_services,
+    ServicesClassification, UserEnvClassification, UserToSwitch, classify_cargo, classify_config,
+    classify_pacman, classify_services, classify_user_env,
 };
 pub use coherence::FailureCoherence;
 pub use compose::plan;
