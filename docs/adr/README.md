@@ -28,3 +28,5 @@ under Plan §9.6 but not gating any milestone exit.
 | [ADR-0009](./0009-cachyos-ci-runner.md) | CachyOS-fidelity CI runner choice | M2 W1 |
 | [ADR-0010](./0010-plan-file-schema-stability.md) | `--plan-file` schema-stability rules | M2 W3 |
 | [ADR-0011](./0011-prune-drift-threshold.md) | `apply --prune` drift threshold | M2 W3 |
+| [ADR-0012](./0012-nix-bootstrap-wiring.md) | Nix bootstrap wiring as a dedicated subcommand | M4 W1 |
+| [ADR-0013](./0013-per-user-nix-conf.md) | Per-user `nix.conf` is left to Home Manager | M4 W1 |
