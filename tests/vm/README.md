@@ -21,6 +21,7 @@ runner is gated by ADR-0009 (CachyOS-fidelity CI runner choice).
 | `vm-06-failure-record.sh` | mutating | Induced `APPLY_SHA_MISMATCH` failure — asserts exit 4, forensic JSON at `<failures_dir>/<plan-id>.json`, and that `gen show` surfaces the SHA-256 message. |
 | `vm-07-user-env-apply.sh` | mutating | Per-user `home-manager switch` via `pearlite apply` (PRD §8.2 phase 7). Asserts `state.toml`'s `[[managed.user_env]]` records the user's `config_hash` after the switch. Requires `home-manager` on `PATH` and the `$PEARLITE_VM_USER` (default `pearlite-vm`) login present on the VM. |
 | `vm-08-user-env-drift.sh` | mutating | Drift detection — apply v1, idempotent re-plan emits no action, mutate `home.nix` to v2, re-plan emits `user_env_switch`, apply v2 updates `state.toml` `config_hash` and keeps `managed.user_env` at one row per user (upsert). |
+| `vm-09-nix-bootstrap.sh` | mutating | `pearlite bootstrap` (ADR-0012) idempotency — short-circuits when `nix --version` already succeeds, writes `/etc/nix/nix.conf` once, second run reports `nix_conf_written: false`. The actual Determinate-installer execution path is not exercised here; ADR-004 SHA verification is unit-tested in `crates/pearlite-userenv`. |
 
 Mutating scripts refuse to run unless `PEARLITE_VM_TEST=1` is set in
 the environment — they install/remove packages, write to `/etc`, and
