@@ -96,6 +96,7 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
             failures_dir,
             plans_dir,
             dry_run,
+            plan_file,
         } => dispatch_apply(
             args,
             ctx,
@@ -104,6 +105,7 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
             failures_dir.as_ref(),
             plans_dir.as_ref(),
             *dry_run,
+            plan_file.as_ref(),
             &metadata_at,
         ),
         Command::Rollback {
@@ -151,6 +153,7 @@ fn dispatch_apply(
     failures_dir: Option<&PathBuf>,
     plans_dir: Option<&PathBuf>,
     dry_run: bool,
+    plan_file: Option<&PathBuf>,
     metadata_at: &dyn Fn(Option<String>) -> Metadata,
 ) -> Envelope {
     let host_path = host_file
@@ -166,9 +169,15 @@ fn dispatch_apply(
         Ok(s) => s,
         Err(payload) => return Envelope::failure(metadata_at(None), payload),
     };
-    let plan = match ctx.engine.plan(&host_path, &state) {
-        Ok(p) => p,
-        Err(e) => return Envelope::failure(metadata_at(None), engine_error_payload(&e)),
+    let plan = match plan_file {
+        Some(path) => match load_plan_file(path) {
+            Ok(p) => p,
+            Err(payload) => return Envelope::failure(metadata_at(None), payload),
+        },
+        None => match ctx.engine.plan(&host_path, &state) {
+            Ok(p) => p,
+            Err(e) => return Envelope::failure(metadata_at(None), engine_error_payload(&e)),
+        },
     };
     let host = plan.host.clone();
     let plan_id = plan.plan_id;
@@ -177,6 +186,11 @@ fn dispatch_apply(
     // plan_id, so a missing JSON file does not break the apply or any
     // future `gen show` lookup. PRD §11 still expects the file to
     // exist for richer per-action forensics, hence the write.
+    //
+    // When --plan-file was used, the source JSON is by definition
+    // already on disk. Re-persisting under <plans_dir>/<plan-id>.json
+    // is still useful: it ensures a uniformly-located forensic copy
+    // even if the operator passed an out-of-tree file.
     persist_plan(&plan, &plans_dir);
     if dry_run {
         return match serde_json::to_value(&plan) {
@@ -222,6 +236,43 @@ fn default_plans_dir(state_path: &Path) -> PathBuf {
         .parent()
         .unwrap_or(Path::new("/var/lib/pearlite"))
         .join("plans")
+}
+
+/// Read a [`pearlite_diff::Plan`] from a JSON file at `path`.
+///
+/// Per ADR-0010, the reader uses strict serde deserialization with no
+/// version-comparison logic: the file must round-trip losslessly
+/// through the current build's `Plan` type. Unknown fields are
+/// tolerated; unknown enum variants in `actions` cause a parse error
+/// — that is the load-bearing strictness that catches stale plans
+/// authored by a future build.
+///
+/// # Errors
+/// - `PLAN_FILE_READ_FAILED` — file is missing or unreadable.
+/// - `PLAN_FILE_PARSE_FAILED` — file is not a valid `Plan` JSON
+///   (malformed JSON, unknown variant, missing required field).
+fn load_plan_file(path: &Path) -> Result<pearlite_diff::Plan, ErrorPayload> {
+    let raw = std::fs::read(path).map_err(|e| ErrorPayload {
+        code: "PLAN_FILE_READ_FAILED".to_owned(),
+        class: "preflight".to_owned(),
+        exit_code: 2,
+        message: format!("could not read {}: {e}", path.display()),
+        hint: format!(
+            "verify {} exists and is readable, or run `pearlite plan` to compute fresh",
+            path.display()
+        ),
+        details: serde_json::Value::Null,
+    })?;
+    serde_json::from_slice::<pearlite_diff::Plan>(&raw).map_err(|e| ErrorPayload {
+        code: "PLAN_FILE_PARSE_FAILED".to_owned(),
+        class: "preflight".to_owned(),
+        exit_code: 2,
+        message: format!("could not parse {}: {e}", path.display()),
+        hint: "the plan file's schema does not match this `pearlite` build (ADR-0010); \
+             re-run `pearlite plan` and persist the new file"
+            .to_owned(),
+        details: serde_json::Value::Null,
+    })
 }
 
 /// Best-effort persist `plan` to `<plans_dir>/<plan-id>.json`.
@@ -877,6 +928,7 @@ package = "linux-cachyos"
                 failures_dir: None,
                 plans_dir: None,
                 dry_run: false,
+                plan_file: None,
             },
         }
     }
@@ -892,6 +944,23 @@ package = "linux-cachyos"
                 failures_dir: None,
                 plans_dir: None,
                 dry_run: true,
+                plan_file: None,
+            },
+        }
+    }
+
+    fn args_for_apply_plan_file(state_file: PathBuf, plan_file: PathBuf) -> Args {
+        Args {
+            format: OutputFormat::Json,
+            config_dir: PathBuf::from("/etc/pearlite/repo"),
+            state_file,
+            command: Command::Apply {
+                host_file: None,
+                snapper_config: "root".to_owned(),
+                failures_dir: None,
+                plans_dir: None,
+                dry_run: false,
+                plan_file: Some(plan_file),
             },
         }
     }
@@ -1060,6 +1129,84 @@ package = "linux-cachyos"
             read_back.history.is_empty(),
             "dry-run must not commit history"
         );
+    }
+
+    #[test]
+    fn apply_plan_file_executes_a_persisted_plan() {
+        // First apply produces a plan file at <state_dir>/plans/<plan-id>.json.
+        // Second apply consumes it via --plan-file; the same plan_id ends up
+        // in state.toml's history.
+        let dir = TempDir::new().expect("tempdir");
+        let host = dir.path().join("forge.ncl");
+        let state_path = dir.path().join("state.toml");
+        write_baseline_state(&state_path);
+
+        let plan_id = apply_and_get_plan_id(&state_path, &host);
+        let plan_file = state_path
+            .parent()
+            .expect("parent")
+            .join("plans")
+            .join(format!("{}.json", plan_id.simple()));
+        assert!(plan_file.exists(), "first apply must persist plan");
+
+        // Reset state.toml to a clean baseline so the second apply
+        // starts from generation 0 again.
+        write_baseline_state(&state_path);
+
+        let ctx = ctx_with(host, MINIMAL_HOST, state_path.clone());
+        let env = dispatch(
+            &args_for_apply_plan_file(state_path.clone(), plan_file),
+            &ctx,
+        );
+
+        assert!(env.error.is_none(), "expected success, got {env:?}");
+        let data = env.data.expect("data");
+        assert_eq!(
+            data.get("plan_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            Some(plan_id.to_string()),
+            "--plan-file must execute the plan_id from the file, not compute fresh"
+        );
+        // Verify state.toml grew a history entry with that plan_id.
+        let read_back = StateStore::new(state_path).read().expect("read state");
+        assert_eq!(read_back.history.len(), 1);
+        assert_eq!(read_back.history[0].plan_id, plan_id);
+    }
+
+    #[test]
+    fn apply_plan_file_missing_yields_read_failed() {
+        let dir = TempDir::new().expect("tempdir");
+        let host = dir.path().join("forge.ncl");
+        let state_path = dir.path().join("state.toml");
+        write_baseline_state(&state_path);
+        let ctx = ctx_with(host, MINIMAL_HOST, state_path.clone());
+        let env = dispatch(
+            &args_for_apply_plan_file(state_path, dir.path().join("does-not-exist.json")),
+            &ctx,
+        );
+
+        let err = env.error.expect("error");
+        assert_eq!(err.code, "PLAN_FILE_READ_FAILED");
+        assert_eq!(err.exit_code, 2);
+        assert_eq!(err.class, "preflight");
+    }
+
+    #[test]
+    fn apply_plan_file_malformed_yields_parse_failed() {
+        let dir = TempDir::new().expect("tempdir");
+        let host = dir.path().join("forge.ncl");
+        let state_path = dir.path().join("state.toml");
+        write_baseline_state(&state_path);
+        let bogus = dir.path().join("bogus.json");
+        std::fs::write(&bogus, b"{ not valid json").expect("write bogus");
+
+        let ctx = ctx_with(host, MINIMAL_HOST, state_path.clone());
+        let env = dispatch(&args_for_apply_plan_file(state_path, bogus), &ctx);
+
+        let err = env.error.expect("error");
+        assert_eq!(err.code, "PLAN_FILE_PARSE_FAILED");
+        assert_eq!(err.exit_code, 2);
     }
 
     #[test]

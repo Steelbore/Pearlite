@@ -86,6 +86,12 @@ pub enum Command {
         /// `pearlite plan`.
         #[arg(long)]
         dry_run: bool,
+        /// Apply a previously persisted plan instead of computing a
+        /// fresh one. The file must be a JSON-serialized
+        /// `pearlite_diff::Plan` whose schema matches the current
+        /// build (ADR-0010 §Decision).
+        #[arg(long, conflicts_with = "dry_run")]
+        plan_file: Option<PathBuf>,
     },
     /// Inspect Pearlite's apply history (a.k.a. generations).
     ///
