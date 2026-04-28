@@ -74,6 +74,14 @@ pub enum Command {
         /// `/var/lib/pearlite/failures`).
         #[arg(long)]
         failures_dir: Option<PathBuf>,
+        /// Directory where plan JSON files are persisted. Each plan
+        /// lands at `<plans_dir>/<plan-id>.json` so `gen show` and
+        /// future `--plan-file` consumers can recover the full
+        /// per-action breakdown that `[[history]]` only summarizes.
+        /// Defaults to `<state_file dir>/plans` (typically
+        /// `/var/lib/pearlite/plans`).
+        #[arg(long)]
+        plans_dir: Option<PathBuf>,
         /// Plan but don't execute. Returns the same envelope shape as
         /// `pearlite plan`.
         #[arg(long)]
