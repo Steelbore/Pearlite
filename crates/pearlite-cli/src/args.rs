@@ -75,6 +75,15 @@ pub enum Command {
         #[arg(long)]
         failures_dir: Option<PathBuf>,
     },
+    /// Inspect Pearlite's apply history (a.k.a. generations).
+    ///
+    /// Read-only. Each generation in `state.toml`'s `[[history]]`
+    /// corresponds to one successful `pearlite apply`.
+    Gen {
+        /// Sub-action against the generation history.
+        #[command(subcommand)]
+        gen_command: GenCommand,
+    },
     /// Roll back a previously applied plan.
     ///
     /// Looks up the `[[history]]` entry by `plan_id` and reverts the
@@ -94,6 +103,18 @@ pub enum Command {
         /// Emit a minimal placeholder schema (M1 scope).
         #[arg(long)]
         bare: bool,
+    },
+}
+
+/// Sub-actions for [`Command::Gen`].
+#[derive(Subcommand, Debug)]
+pub enum GenCommand {
+    /// List every generation in the history (oldest first).
+    List,
+    /// Show one generation by `plan_id`.
+    Show {
+        /// Plan UUID to display.
+        plan_id: Uuid,
     },
 }
 

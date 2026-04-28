@@ -12,7 +12,7 @@ mod dispatch;
 mod envelope;
 mod render;
 
-pub use args::{Args, Command, OutputFormat};
+pub use args::{Args, Command, GenCommand, OutputFormat};
 pub use dispatch::{RunContext, dispatch};
 pub use envelope::{Envelope, ErrorPayload, Metadata};
 pub use render::{render_human, render_json};
