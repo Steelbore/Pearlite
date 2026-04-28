@@ -94,12 +94,14 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
             host_file,
             snapper_config,
             failures_dir,
+            dry_run,
         } => dispatch_apply(
             args,
             ctx,
             host_file.as_ref(),
             snapper_config,
             failures_dir.as_ref(),
+            *dry_run,
             &metadata_at,
         ),
         Command::Rollback {
@@ -133,12 +135,19 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
 /// Plan → apply → render. Pulled out of [`dispatch`] so the top-level
 /// match stays under clippy's `too_many_lines` limit; logic is
 /// otherwise identical to the inline form.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "dispatch_apply mirrors Command::Apply's variant fields plus the \
+              shared metadata closure; collapsing them would just hide what's \
+              load-bearing"
+)]
 fn dispatch_apply(
     args: &Args,
     ctx: &RunContext,
     host_file: Option<&PathBuf>,
     snapper_config: &str,
     failures_dir: Option<&PathBuf>,
+    dry_run: bool,
     metadata_at: &dyn Fn(Option<String>) -> Metadata,
 ) -> Envelope {
     let host_path = host_file
@@ -157,6 +166,22 @@ fn dispatch_apply(
     };
     let host = plan.host.clone();
     let plan_id = plan.plan_id;
+    if dry_run {
+        return match serde_json::to_value(&plan) {
+            Ok(v) => Envelope::success(metadata_at(Some(host)), v),
+            Err(e) => Envelope::failure(
+                metadata_at(None),
+                ErrorPayload {
+                    code: "RENDER_FAILED".to_owned(),
+                    class: "internal".to_owned(),
+                    exit_code: 1,
+                    message: format!("could not serialize plan: {e}"),
+                    hint: "report this as a Pearlite bug".to_owned(),
+                    details: serde_json::Value::Null,
+                },
+            ),
+        };
+    }
     match ctx.engine.apply_plan(
         &plan,
         ctx.pacman.as_ref(),
@@ -741,6 +766,21 @@ package = "linux-cachyos"
                 host_file: Some(host_file),
                 snapper_config: "root".to_owned(),
                 failures_dir: None,
+                dry_run: false,
+            },
+        }
+    }
+
+    fn args_for_apply_dry_run(host_file: PathBuf, state_file: PathBuf) -> Args {
+        Args {
+            format: OutputFormat::Json,
+            config_dir: PathBuf::from("/etc/pearlite/repo"),
+            state_file,
+            command: Command::Apply {
+                host_file: Some(host_file),
+                snapper_config: "root".to_owned(),
+                failures_dir: None,
+                dry_run: true,
             },
         }
     }
@@ -878,6 +918,37 @@ package = "linux-cachyos"
         assert_eq!(err.exit_code, 2);
         assert_eq!(err.class, "preflight");
         assert!(!err.hint.is_empty());
+    }
+
+    #[test]
+    fn apply_dry_run_returns_plan_envelope_without_executing() {
+        let dir = TempDir::new().expect("tempdir");
+        let host = dir.path().join("forge.ncl");
+        let state_path = dir.path().join("state.toml");
+        write_baseline_state(&state_path);
+        let ctx = ctx_with(host.clone(), MINIMAL_HOST, state_path.clone());
+        let env = dispatch(&args_for_apply_dry_run(host, state_path.clone()), &ctx);
+
+        assert!(env.error.is_none(), "expected success, got {env:?}");
+        let data = env.data.expect("data");
+        // dry-run yields the Plan, not the ApplyOutcome — distinguishable
+        // by the presence of `actions` (always present, possibly empty)
+        // and the absence of `actions_executed`.
+        assert!(
+            data.get("actions").is_some(),
+            "dry-run must return the Plan envelope shape"
+        );
+        assert!(
+            data.get("actions_executed").is_none(),
+            "dry-run must NOT return ApplyOutcome shape"
+        );
+
+        // No history was written — apply was skipped.
+        let read_back = StateStore::new(state_path).read().expect("read state");
+        assert!(
+            read_back.history.is_empty(),
+            "dry-run must not commit history"
+        );
     }
 
     #[test]
