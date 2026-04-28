@@ -3,7 +3,7 @@
 
 //! Command dispatch — turns parsed [`Args`] into an [`Envelope`].
 
-use crate::args::{Args, Command};
+use crate::args::{Args, Command, GenCommand};
 use crate::envelope::{Envelope, ErrorPayload, Metadata};
 use pearlite_cargo::Cargo;
 use pearlite_engine::Engine;
@@ -106,6 +106,7 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
             plan_id,
             snapper_config,
         } => dispatch_rollback(ctx, *plan_id, snapper_config, &metadata_at),
+        Command::Gen { gen_command } => dispatch_gen(ctx, gen_command, &metadata_at),
         Command::Schema { bare } => {
             if *bare {
                 Envelope::success(metadata_at(None), bare_schema())
@@ -200,12 +201,113 @@ fn dispatch_rollback(
     }
 }
 
+/// Dispatch arm for `pearlite gen list` / `pearlite gen show`.
+///
+/// Both sub-actions are read-only views into `state.toml`'s
+/// `[[history]]` array. Like `plan` and `status`, missing-state is
+/// tolerated and surfaces as an empty list (`gen list`) or a typed
+/// `GEN_NOT_FOUND` error (`gen show`).
+fn dispatch_gen(
+    ctx: &RunContext,
+    gen_command: &GenCommand,
+    metadata_at: &dyn Fn(Option<String>) -> Metadata,
+) -> Envelope {
+    let state = match read_state_or_empty(&ctx.state_path, &ctx.fallback_host) {
+        Ok(s) => s,
+        Err(payload) => return Envelope::failure(metadata_at(None), payload),
+    };
+    match gen_command {
+        GenCommand::List => {
+            let entries: Vec<serde_json::Value> =
+                state.history.iter().map(history_entry_view).collect();
+            Envelope::success(
+                metadata_at(Some(state.host.clone())),
+                serde_json::json!({
+                    "generations": entries,
+                    "count": entries.len(),
+                }),
+            )
+        }
+        GenCommand::Show { plan_id } => {
+            match state.history.iter().find(|h| h.plan_id == *plan_id) {
+                Some(entry) => Envelope::success(
+                    metadata_at(Some(state.host.clone())),
+                    full_history_entry_view(entry),
+                ),
+                None => Envelope::failure(
+                    metadata_at(Some(state.host.clone())),
+                    ErrorPayload {
+                        code: "GEN_NOT_FOUND".to_owned(),
+                        class: "preflight".to_owned(),
+                        exit_code: 2,
+                        message: format!(
+                            "no generation with plan_id {plan_id} in state.toml history"
+                        ),
+                        hint: "pearlite gen list  # show known plan IDs and generations".to_owned(),
+                        details: serde_json::Value::Null,
+                    },
+                ),
+            }
+        }
+    }
+}
+
+/// Compact per-row view used by `gen list`: identifying fields plus
+/// the headline summary string. Full snapshots / git revision are
+/// reserved for `gen show`.
+fn history_entry_view(entry: &pearlite_state::HistoryEntry) -> serde_json::Value {
+    serde_json::json!({
+        "plan_id": entry.plan_id,
+        "generation": entry.generation,
+        "applied_at": iso8601(entry.applied_at),
+        "duration_ms": entry.duration_ms,
+        "actions_executed": entry.actions_executed,
+        "summary": entry.summary,
+    })
+}
+
+/// Full per-entry view used by `gen show`: includes both snapshots,
+/// the git-revision pair, and everything `history_entry_view` already
+/// emits.
+fn full_history_entry_view(entry: &pearlite_state::HistoryEntry) -> serde_json::Value {
+    serde_json::json!({
+        "plan_id": entry.plan_id,
+        "generation": entry.generation,
+        "applied_at": iso8601(entry.applied_at),
+        "duration_ms": entry.duration_ms,
+        "actions_executed": entry.actions_executed,
+        "summary": entry.summary,
+        "snapshot_pre": {
+            "id": entry.snapshot_pre.id,
+            "label": entry.snapshot_pre.label,
+            "created_at": iso8601(entry.snapshot_pre.created_at),
+        },
+        "snapshot_post": {
+            "id": entry.snapshot_post.id,
+            "label": entry.snapshot_post.label,
+            "created_at": iso8601(entry.snapshot_post.created_at),
+        },
+        "git_revision": entry.git_revision,
+        "git_dirty": entry.git_dirty,
+    })
+}
+
+fn iso8601(t: OffsetDateTime) -> String {
+    use time::format_description::well_known::Iso8601;
+    t.format(&Iso8601::DEFAULT)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
 fn label_for(command: &Command) -> String {
     match command {
         Command::Plan { .. } => "pearlite plan".to_owned(),
         Command::Status { .. } => "pearlite status".to_owned(),
         Command::Apply { .. } => "pearlite apply".to_owned(),
         Command::Rollback { .. } => "pearlite rollback".to_owned(),
+        Command::Gen { gen_command } => match gen_command {
+            GenCommand::List => "pearlite gen list".to_owned(),
+            GenCommand::Show { .. } => "pearlite gen show".to_owned(),
+        },
         Command::Schema { .. } => "pearlite schema".to_owned(),
     }
 }
@@ -879,6 +981,136 @@ package = "linux-cachyos"
                 snapper_config: "root".to_owned(),
             },
         }
+    }
+
+    fn args_for_gen_list(state_file: PathBuf) -> Args {
+        Args {
+            format: OutputFormat::Json,
+            config_dir: PathBuf::from("/etc/pearlite/repo"),
+            state_file,
+            command: Command::Gen {
+                gen_command: GenCommand::List,
+            },
+        }
+    }
+
+    fn args_for_gen_show(plan_id: uuid::Uuid, state_file: PathBuf) -> Args {
+        Args {
+            format: OutputFormat::Json,
+            config_dir: PathBuf::from("/etc/pearlite/repo"),
+            state_file,
+            command: Command::Gen {
+                gen_command: GenCommand::Show { plan_id },
+            },
+        }
+    }
+
+    #[test]
+    fn gen_list_returns_empty_count_zero_when_state_missing() {
+        let dir = TempDir::new().expect("tempdir");
+        let host = dir.path().join("forge.ncl");
+        let state_path = dir.path().join("state.toml");
+        let ctx = ctx_with(host, MINIMAL_HOST, state_path.clone());
+        let env = dispatch(&args_for_gen_list(state_path), &ctx);
+
+        assert!(env.error.is_none(), "expected success, got {env:?}");
+        let data = env.data.expect("data");
+        assert_eq!(
+            data.get("count").and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+        let gens = data
+            .get("generations")
+            .and_then(|v| v.as_array())
+            .expect("generations array");
+        assert!(gens.is_empty());
+    }
+
+    #[test]
+    fn gen_list_enumerates_history_entries() {
+        let dir = TempDir::new().expect("tempdir");
+        let state_path = dir.path().join("state.toml");
+        let plan_id = write_state_with_history(&state_path, 100);
+        let ctx = ctx_with(
+            dir.path().join("forge.ncl"),
+            MINIMAL_HOST,
+            state_path.clone(),
+        );
+        let env = dispatch(&args_for_gen_list(state_path), &ctx);
+
+        assert!(env.error.is_none(), "expected success, got {env:?}");
+        let data = env.data.expect("data");
+        assert_eq!(
+            data.get("count").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        let gens = data
+            .get("generations")
+            .and_then(|v| v.as_array())
+            .expect("generations array");
+        assert_eq!(gens.len(), 1);
+        assert_eq!(
+            gens[0]
+                .get("plan_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            Some(plan_id.to_string())
+        );
+        assert_eq!(
+            gens[0]
+                .get("generation")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn gen_show_returns_full_entry_for_known_plan_id() {
+        let dir = TempDir::new().expect("tempdir");
+        let state_path = dir.path().join("state.toml");
+        let plan_id = write_state_with_history(&state_path, 77);
+        let ctx = ctx_with(
+            dir.path().join("forge.ncl"),
+            MINIMAL_HOST,
+            state_path.clone(),
+        );
+        let env = dispatch(&args_for_gen_show(plan_id, state_path), &ctx);
+
+        assert!(env.error.is_none(), "expected success, got {env:?}");
+        let data = env.data.expect("data");
+        assert_eq!(
+            data.get("snapshot_pre")
+                .and_then(|v| v.get("id"))
+                .and_then(serde_json::Value::as_u64),
+            Some(77)
+        );
+        assert_eq!(
+            data.get("snapshot_post")
+                .and_then(|v| v.get("id"))
+                .and_then(serde_json::Value::as_u64),
+            Some(78)
+        );
+        assert_eq!(
+            data.get("generation").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn gen_show_unknown_plan_id_yields_gen_not_found() {
+        let dir = TempDir::new().expect("tempdir");
+        let state_path = dir.path().join("state.toml");
+        let _known = write_state_with_history(&state_path, 5);
+        let ctx = ctx_with(
+            dir.path().join("forge.ncl"),
+            MINIMAL_HOST,
+            state_path.clone(),
+        );
+        let env = dispatch(&args_for_gen_show(uuid::Uuid::now_v7(), state_path), &ctx);
+
+        let err = env.error.expect("error");
+        assert_eq!(err.code, "GEN_NOT_FOUND");
+        assert_eq!(err.exit_code, 2);
     }
 
     #[test]
