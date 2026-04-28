@@ -66,6 +66,14 @@ pub enum ApplyError {
     /// Home Manager / user-env adapter failed during phase-7 dispatch.
     #[error(transparent)]
     Userenv(#[from] pearlite_userenv::UserenvError),
+    /// Determinate Nix installer adapter failed while probing nix
+    /// presence during the apply preflight (ADR-0012 decision 3).
+    #[error(transparent)]
+    NixProbe(#[from] pearlite_userenv::InstallerError),
+    /// Apply preflight: plan would run a `UserEnvSwitch` but
+    /// `nix --version` fails. Class 1 (preflight) — bootstrap first.
+    #[error("nix is not installed; run `pearlite bootstrap` first")]
+    NixNotInstalled,
 }
 
 /// Errors emitted by [`Engine::rollback`](crate::Engine::rollback).

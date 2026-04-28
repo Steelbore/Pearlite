@@ -32,7 +32,7 @@ use pearlite_pacman::Pacman;
 use pearlite_snapper::{Snapper, SnapshotInfo};
 use pearlite_state::{FailureRef, HistoryEntry, SnapshotRef, StateStore, UserEnvRecord};
 use pearlite_systemd::{Scope as SystemdScope, Systemd};
-use pearlite_userenv::HomeManagerBackend;
+use pearlite_userenv::{HomeManagerBackend, NixInstaller};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -91,6 +91,11 @@ pub struct ApplyContext<'a> {
     pub snapper: &'a dyn Snapper,
     /// Home Manager backend for phase-7 user-env switches.
     pub home_manager: &'a dyn HomeManagerBackend,
+    /// Determinate Nix probe used by the apply-time preflight (ADR-0012
+    /// decision 3): when the plan contains [`UserEnvSwitch`](Action)
+    /// actions and `nix --version` fails, apply halts with
+    /// `NIX_NOT_INSTALLED` before any system mutation.
+    pub nix_installer: &'a dyn NixInstaller,
     /// Snapper config name to take snapshots against (typically
     /// `"root"`).
     pub snapper_config: &'a str,
@@ -151,6 +156,16 @@ impl Engine {
         ctx: &ApplyContext<'_>,
     ) -> Result<ApplyOutcome, ApplyError> {
         let started = Instant::now();
+
+        // ADR-0012 decision 3: when the plan would dispatch a
+        // UserEnvSwitch (i.e. any host user has home_manager.enabled =
+        // true and either first-apply or HM-config drift), `nix` must
+        // already be on PATH. We probe via the installer adapter
+        // before any snapshot or db sync — failing here keeps apply
+        // truly non-mutating.
+        if needs_nix(plan) && !ctx.nix_installer.nix_installed()? {
+            return Err(ApplyError::NixNotInstalled);
+        }
 
         let snapshot_pre = ctx
             .snapper
@@ -391,6 +406,12 @@ fn needs_db_sync(plan: &Plan) -> bool {
         .any(|a| matches!(a, Action::PacmanInstall { .. } | Action::AurInstall { .. }))
 }
 
+fn needs_nix(plan: &Plan) -> bool {
+    plan.actions
+        .iter()
+        .any(|a| matches!(a, Action::UserEnvSwitch { .. }))
+}
+
 fn exec_action(
     action: &Action,
     pacman: &dyn Pacman,
@@ -553,7 +574,7 @@ mod tests {
     use pearlite_snapper::MockSnapper;
     use pearlite_state::SCHEMA_VERSION;
     use pearlite_systemd::MockSystemd;
-    use pearlite_userenv::MockHmBackend;
+    use pearlite_userenv::{MockHmBackend, MockNixInstaller};
     use std::path::PathBuf;
     use tempfile::TempDir;
     use time::OffsetDateTime;
@@ -583,12 +604,17 @@ mod tests {
     /// Build an [`ApplyContext`] from the per-test mock adapters and
     /// state paths. Tests universally use `snapper_config = "root"`,
     /// so the helper hard-codes it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test helper mirrors ApplyContext fields one-for-one"
+    )]
     fn make_ctx<'a>(
         pacman: &'a MockPacman,
         cargo: &'a MockCargo,
         systemd: &'a MockSystemd,
         snapper: &'a MockSnapper,
         home_manager: &'a MockHmBackend,
+        nix_installer: &'a MockNixInstaller,
         state_path: &'a Path,
         failures_dir: &'a Path,
     ) -> ApplyContext<'a> {
@@ -598,6 +624,7 @@ mod tests {
             systemd,
             snapper,
             home_manager,
+            nix_installer,
             snapper_config: "root",
             state_path,
             failures_dir,
@@ -647,6 +674,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -659,6 +687,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -690,6 +719,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -705,6 +735,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -724,6 +755,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -745,6 +777,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -760,6 +793,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -781,6 +815,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -795,6 +830,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -811,6 +847,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -831,6 +868,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -847,6 +885,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -870,6 +909,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -890,6 +930,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -907,6 +948,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -930,6 +972,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -957,6 +1000,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -1009,6 +1053,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -1027,6 +1072,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -1048,6 +1094,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -1064,6 +1111,83 @@ mod tests {
         assert_eq!(read_back.managed.user_env[0].config_hash, "v2");
         // Mock's generation counter is monotonic across the two switches.
         assert_eq!(read_back.managed.user_env[0].generation, 2);
+    }
+
+    #[test]
+    fn apply_halts_at_preflight_when_nix_not_installed() {
+        // ADR-0012 decision 3: a plan with UserEnvSwitch and missing
+        // nix returns NixNotInstalled before any snapshot or db sync.
+        let pacman = MockPacman::new();
+        let cargo = MockCargo::new();
+        let systemd = MockSystemd::new();
+        let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
+        // Default MockNixInstaller reports nix NOT installed.
+        let nix_installer = MockNixInstaller::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let (state_path, failures_dir) = setup_state(&state_dir);
+
+        let err = engine()
+            .apply_plan(
+                &plan_with_actions(vec![Action::UserEnvSwitch {
+                    user: "alice".to_owned(),
+                    config_path: PathBuf::from("/repo/users/alice"),
+                    mode: pearlite_schema::HomeManagerMode::Standalone,
+                    channel: "release-24.11".to_owned(),
+                    config_hash: "h".to_owned(),
+                }]),
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &nix_installer,
+                    &state_path,
+                    &failures_dir,
+                ),
+            )
+            .expect_err("must fail");
+        assert!(matches!(err, ApplyError::NixNotInstalled), "got {err:?}");
+
+        // Pre-snapshot was never taken (preflight returns first).
+        let snaps = snapper.list("root").expect("snapper list");
+        assert!(snaps.is_empty(), "no snapshots: got {snaps:?}");
+        // No FailureRef written either — preflight is class 1, no
+        // forensic record needed.
+        let read_back = StateStore::new(state_path).read().expect("read state");
+        assert!(read_back.failures.is_empty());
+        assert!(read_back.history.is_empty());
+    }
+
+    #[test]
+    fn apply_with_no_user_env_switch_skips_nix_probe() {
+        // Plan without UserEnvSwitch: nix probe is not called, so a
+        // not-installed installer is fine.
+        let pacman = MockPacman::new();
+        let cargo = MockCargo::new();
+        let systemd = MockSystemd::new();
+        let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let (state_path, failures_dir) = setup_state(&state_dir);
+
+        engine()
+            .apply_plan(
+                &plan_with_actions(vec![]),
+                &make_ctx(
+                    &pacman,
+                    &cargo,
+                    &systemd,
+                    &snapper,
+                    &home_manager,
+                    &nix_installer,
+                    &state_path,
+                    &failures_dir,
+                ),
+            )
+            .expect("apply");
     }
 
     #[test]
@@ -1086,6 +1210,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -1104,6 +1229,7 @@ mod tests {
                     systemd: &systemd,
                     snapper: &snapper,
                     home_manager: &FailingHm,
+                    nix_installer: &nix_installer,
                     snapper_config: "root",
                     state_path: &state_path,
                     failures_dir: &failures_dir,
@@ -1129,6 +1255,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -1153,6 +1280,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -1172,6 +1300,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -1196,6 +1325,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -1214,6 +1344,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -1229,6 +1360,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -1288,6 +1420,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
 
         engine_with_repo_root(repo.path().to_path_buf())
             .apply_plan(
@@ -1306,6 +1439,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -1335,6 +1469,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
 
         let err = engine_with_repo_root(repo.path().to_path_buf())
             .apply_plan(
@@ -1354,6 +1489,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -1388,6 +1524,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
 
         let err = engine_with_repo_root(repo.path().to_path_buf())
             .apply_plan(
@@ -1406,6 +1543,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -1444,6 +1582,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -1456,6 +1595,7 @@ mod tests {
                     systemd: &systemd,
                     snapper: &FailingSnapper,
                     home_manager: &home_manager,
+                    nix_installer: &nix_installer,
                     snapper_config: "root",
                     state_path: &state_path,
                     failures_dir: &failures_dir,
@@ -1472,6 +1612,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         // Don't write a base state — apply_plan must error rather than
         // silently creating one.
@@ -1487,6 +1628,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -1502,6 +1644,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -1526,6 +1669,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -1568,6 +1712,7 @@ mod tests {
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
 
         let _ = engine_with_repo_root(repo.path().to_path_buf())
             .apply_plan(
@@ -1586,6 +1731,7 @@ mod tests {
                     &systemd,
                     &snapper,
                     &home_manager,
+                    &nix_installer,
                     &state_path,
                     &failures_dir,
                 ),
@@ -1644,6 +1790,7 @@ mod tests {
         let cargo = MockCargo::new();
         let snapper = MockSnapper::new();
         let home_manager = MockHmBackend::new();
+        let nix_installer = MockNixInstaller::with_already_installed();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -1658,6 +1805,7 @@ mod tests {
                     systemd: &FailingRestart,
                     snapper: &snapper,
                     home_manager: &home_manager,
+                    nix_installer: &nix_installer,
                     snapper_config: "root",
                     state_path: &state_path,
                     failures_dir: &failures_dir,

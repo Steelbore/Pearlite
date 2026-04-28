@@ -184,6 +184,18 @@ impl NixInstaller for MockNixInstaller {
         clippy::expect_used,
         reason = "test utility — mutex-poison panic is unreachable"
     )]
+    fn nix_installed(&self) -> Result<bool, InstallerError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("MockNixInstaller mutex must not be poisoned")
+            .already)
+    }
+
+    #[allow(
+        clippy::expect_used,
+        reason = "test utility — mutex-poison panic is unreachable"
+    )]
     fn install_if_missing(
         &self,
         script_path: &Path,
