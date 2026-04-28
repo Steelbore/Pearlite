@@ -88,11 +88,7 @@ impl Engine {
         probed.config_files = Some(pearlite_fs::probe_config_files(&declared.config_files));
 
         let declared_source_sha256 = self.compute_source_sha256(&declared.config_files)?;
-        // M3 W2 placeholder: the user-env hash map is empty for now,
-        // which makes classify_user_env always emit a UserEnvSwitch
-        // for every HM-enabled user (first-apply path). The next PR
-        // wires the actual config-directory hash computation.
-        let declared_user_env_hash: BTreeMap<String, String> = BTreeMap::new();
+        let declared_user_env_hash = self.compute_user_env_hashes(&declared.users)?;
 
         Ok(pearlite_diff::plan(
             &declared,
@@ -104,6 +100,35 @@ impl Engine {
             OffsetDateTime::now_utc(),
             prune,
         ))
+    }
+
+    /// Compute hex-encoded SHA-256 of each declared user's HM
+    /// `config_path` (relative to `repo_root`). Users without an
+    /// `home_manager` block, or whose `enabled = false`, or whose
+    /// resolved path doesn't exist on disk, are silently omitted —
+    /// the diff classifier treats a missing entry as "first apply or
+    /// recompute defensively", which is the correct behaviour when we
+    /// can't prove what the live config looks like.
+    fn compute_user_env_hashes(
+        &self,
+        users: &[pearlite_schema::UserDecl],
+    ) -> Result<BTreeMap<String, String>, EngineError> {
+        let mut out = BTreeMap::new();
+        for user in users {
+            let Some(hm) = user.home_manager.as_ref() else {
+                continue;
+            };
+            if !hm.enabled {
+                continue;
+            }
+            let resolved = self.repo_root.join(&hm.config_path);
+            if !resolved.exists() {
+                continue;
+            }
+            let digest = pearlite_fs::sha256_dir(&resolved)?;
+            out.insert(user.name.clone(), hex_encode(&digest));
+        }
+        Ok(out)
     }
 
     fn compute_source_sha256(
