@@ -5,6 +5,7 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+use uuid::Uuid;
 
 /// Top-level Pearlite CLI argument structure.
 #[derive(Parser, Debug)]
@@ -73,6 +74,20 @@ pub enum Command {
         /// `/var/lib/pearlite/failures`).
         #[arg(long)]
         failures_dir: Option<PathBuf>,
+    },
+    /// Roll back a previously applied plan.
+    ///
+    /// Looks up the `[[history]]` entry by `plan_id` and reverts the
+    /// root subvolume to the entry's pre-apply Snapper snapshot. The
+    /// next `pearlite plan` re-derives state from the live system.
+    Rollback {
+        /// Plan UUID to roll back to (the entry's `snapshot_pre`
+        /// snapshot is what gets restored).
+        plan_id: Uuid,
+        /// Snapper config to roll back. Must match the config the
+        /// original apply used (typically `"root"`).
+        #[arg(long, default_value = "root")]
+        snapper_config: String,
     },
     /// Emit JSON Schema describing the CLI surface.
     Schema {

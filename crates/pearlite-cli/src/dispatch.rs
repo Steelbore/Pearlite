@@ -102,6 +102,10 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
             failures_dir.as_ref(),
             &metadata_at,
         ),
+        Command::Rollback {
+            plan_id,
+            snapper_config,
+        } => dispatch_rollback(ctx, *plan_id, snapper_config, &metadata_at),
         Command::Schema { bare } => {
             if *bare {
                 Envelope::success(metadata_at(None), bare_schema())
@@ -170,11 +174,38 @@ fn dispatch_apply(
     }
 }
 
+/// Dispatch arm for `pearlite rollback <plan-id>`.
+///
+/// `Engine::rollback` reads `state.toml`, finds the matching
+/// `[[history]]` entry, and dispatches to `snapper.rollback(snapshot_pre.id)`.
+/// `state.toml` is not rewritten — the btrfs revert restores the
+/// entire root subvolume; the next `pearlite plan` re-derives.
+fn dispatch_rollback(
+    ctx: &RunContext,
+    plan_id: uuid::Uuid,
+    snapper_config: &str,
+    metadata_at: &dyn Fn(Option<String>) -> Metadata,
+) -> Envelope {
+    match ctx.engine.rollback(
+        plan_id,
+        ctx.snapper.as_ref(),
+        snapper_config,
+        &ctx.state_path,
+    ) {
+        Ok(outcome) => Envelope::success(metadata_at(None), rollback_outcome_view(&outcome)),
+        Err(e) => Envelope::failure(
+            metadata_at(None),
+            rollback_error_payload(&e, &ctx.state_path),
+        ),
+    }
+}
+
 fn label_for(command: &Command) -> String {
     match command {
         Command::Plan { .. } => "pearlite plan".to_owned(),
         Command::Status { .. } => "pearlite status".to_owned(),
         Command::Apply { .. } => "pearlite apply".to_owned(),
+        Command::Rollback { .. } => "pearlite rollback".to_owned(),
         Command::Schema { .. } => "pearlite schema".to_owned(),
     }
 }
@@ -297,6 +328,58 @@ fn bare_schema() -> serde_json::Value {
         "description": "M1 placeholder. Anthropic / OpenAI / Gemini / MCP formats land in M5.",
         "type": "object",
     })
+}
+
+/// Render-friendly subset of [`pearlite_engine::RollbackOutcome`].
+fn rollback_outcome_view(outcome: &pearlite_engine::RollbackOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "plan_id": outcome.plan_id,
+        "generation": outcome.generation,
+        "snapshot_pre": {
+            "id": outcome.snapshot_pre.id,
+            "label": outcome.snapshot_pre.label,
+        },
+    })
+}
+
+/// Map a [`RollbackError`](pearlite_engine::RollbackError) to a CLI
+/// [`ErrorPayload`].
+///
+/// `PlanNotFound` is class 2 (preflight, exit 2) — the user typed a
+/// `plan_id` that does not exist; nothing was changed. `Snapper`
+/// failures are class 3 (apply-recoverable, exit 4) since the system
+/// state is whatever Snapper left it (possibly partially reverted).
+/// `State` read failures are class 2.
+fn rollback_error_payload(err: &pearlite_engine::RollbackError, state_path: &Path) -> ErrorPayload {
+    use pearlite_engine::RollbackError;
+    let (code, class, exit_code, hint) = match err {
+        RollbackError::PlanNotFound { .. } => (
+            "ROLLBACK_NOT_FOUND",
+            "preflight",
+            2_u8,
+            "pearlite gen list  # show known plan IDs and generations".to_owned(),
+        ),
+        RollbackError::Snapper(_) => (
+            "ROLLBACK_SNAPPER",
+            "apply-recoverable",
+            4_u8,
+            "snapper -c root list  # verify snapper is healthy, then retry".to_owned(),
+        ),
+        RollbackError::State(_) => (
+            "ROLLBACK_STATE",
+            "preflight",
+            2,
+            format!("verify {} exists and is readable", state_path.display()),
+        ),
+    };
+    ErrorPayload {
+        code: code.to_owned(),
+        class: class.to_owned(),
+        exit_code,
+        message: format!("{err}"),
+        hint,
+        details: serde_json::Value::Null,
+    }
 }
 
 /// Map an [`ApplyError`](pearlite_engine::ApplyError) to a CLI
@@ -729,6 +812,190 @@ package = "linux-cachyos"
         // when actions_executed == 0.
         let p = default_failures_dir(Path::new("/var/lib/pearlite/state.toml"));
         assert_eq!(p, PathBuf::from("/var/lib/pearlite/failures"));
+    }
+
+    /// Pre-seed `state_path` with a `[[history]]` entry referencing
+    /// snapshot id `pre_snapshot_id`. Returns the `plan_id`.
+    fn write_state_with_history(state_path: &Path, pre_snapshot_id: u64) -> uuid::Uuid {
+        let plan_id = uuid::Uuid::now_v7();
+        let store = StateStore::new(state_path.to_path_buf());
+        let entry = pearlite_state::HistoryEntry {
+            plan_id,
+            generation: 1,
+            applied_at: OffsetDateTime::from_unix_timestamp(1_777_000_000).expect("ts"),
+            duration_ms: 0,
+            snapshot_pre: pearlite_state::SnapshotRef {
+                id: pre_snapshot_id,
+                label: "pre-pearlite-apply-aaaaaaaa".to_owned(),
+                created_at: OffsetDateTime::from_unix_timestamp(1_777_000_000).expect("ts"),
+            },
+            snapshot_post: pearlite_state::SnapshotRef {
+                id: pre_snapshot_id + 1,
+                label: "post-pearlite-apply-aaaaaaaa".to_owned(),
+                created_at: OffsetDateTime::from_unix_timestamp(1_777_000_000).expect("ts"),
+            },
+            actions_executed: 0,
+            git_revision: None,
+            git_dirty: false,
+            summary: String::new(),
+        };
+        let state = State {
+            schema_version: SCHEMA_VERSION,
+            host: "forge".to_owned(),
+            tool_version: "0.1.0".to_owned(),
+            config_dir: PathBuf::from("/cfg"),
+            last_apply: None,
+            last_modified: None,
+            managed: pearlite_state::Managed::default(),
+            adopted: pearlite_state::Adopted::default(),
+            history: vec![entry],
+            reconciliations: Vec::new(),
+            failures: Vec::new(),
+            reserved: std::collections::BTreeMap::new(),
+        };
+        store.write_atomic(&state).expect("write state");
+        plan_id
+    }
+
+    /// Build a [`MockSnapper`] pre-loaded with `n` snapshots so its
+    /// monotonic ID counter is past whatever IDs the test seeds.
+    fn snapper_with_n_snapshots(n: u64) -> MockSnapper {
+        let snapper = MockSnapper::new();
+        for i in 0..n {
+            snapper
+                .create("root", &format!("seed-{i}"))
+                .expect("seed snapshot");
+        }
+        snapper
+    }
+
+    fn args_for_rollback(plan_id: uuid::Uuid, state_file: PathBuf) -> Args {
+        Args {
+            format: OutputFormat::Json,
+            config_dir: PathBuf::from("/etc/pearlite/repo"),
+            state_file,
+            command: Command::Rollback {
+                plan_id,
+                snapper_config: "root".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn rollback_succeeds_against_known_plan_id() {
+        let dir = TempDir::new().expect("tempdir");
+        let state_path = dir.path().join("state.toml");
+        let plan_id = write_state_with_history(&state_path, 42);
+
+        let nickel = MockNickel::new();
+        let probe = Box::new(MockProbe::with_state(empty_probed()));
+        let engine = Engine::new(Box::new(nickel), probe, PathBuf::from("/cfg-repo"));
+        let ctx = RunContext {
+            engine,
+            state_path: state_path.clone(),
+            fallback_host: "forge".to_owned(),
+            pacman: Box::new(MockPacman::new()),
+            cargo: Box::new(MockCargo::new()),
+            systemd: Box::new(MockSystemd::new()),
+            snapper: Box::new(snapper_with_n_snapshots(50)),
+        };
+        let args = args_for_rollback(plan_id, state_path);
+        let env = dispatch(&args, &ctx);
+
+        assert!(env.error.is_none(), "expected success, got {env:?}");
+        let data = env.data.expect("data");
+        assert_eq!(env.metadata.command, "pearlite rollback");
+        assert_eq!(
+            data.get("generation").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            data.get("snapshot_pre")
+                .and_then(|v| v.get("id"))
+                .and_then(serde_json::Value::as_u64),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn rollback_unknown_plan_id_yields_not_found() {
+        let dir = TempDir::new().expect("tempdir");
+        let state_path = dir.path().join("state.toml");
+        let _known = write_state_with_history(&state_path, 10);
+        let unknown = uuid::Uuid::now_v7();
+
+        let ctx = ctx_with(
+            dir.path().join("forge.ncl"),
+            MINIMAL_HOST,
+            state_path.clone(),
+        );
+        let args = args_for_rollback(unknown, state_path);
+        let env = dispatch(&args, &ctx);
+
+        let err = env.error.expect("error");
+        assert_eq!(err.code, "ROLLBACK_NOT_FOUND");
+        assert_eq!(err.exit_code, 2);
+        assert_eq!(err.class, "preflight");
+    }
+
+    #[test]
+    fn rollback_missing_state_file_yields_state_error() {
+        let dir = TempDir::new().expect("tempdir");
+        // Don't write a state.toml; rollback must surface a State
+        // error rather than tolerate-and-substitute.
+        let state_path = dir.path().join("state.toml");
+        let ctx = ctx_with(
+            dir.path().join("forge.ncl"),
+            MINIMAL_HOST,
+            state_path.clone(),
+        );
+        let args = args_for_rollback(uuid::Uuid::now_v7(), state_path);
+        let env = dispatch(&args, &ctx);
+
+        let err = env.error.expect("error");
+        assert_eq!(err.code, "ROLLBACK_STATE");
+        assert_eq!(err.exit_code, 2);
+    }
+
+    #[test]
+    fn rollback_snapper_failure_maps_to_apply_recoverable() {
+        use pearlite_snapper::{Snapper, SnapperError, SnapshotInfo};
+        struct FailingSnapper;
+        impl Snapper for FailingSnapper {
+            fn create(&self, _: &str, _: &str) -> Result<SnapshotInfo, SnapperError> {
+                Err(SnapperError::NotInPath { hint: "test" })
+            }
+            fn rollback(&self, _: &str, _: u64) -> Result<(), SnapperError> {
+                Err(SnapperError::NotInPath { hint: "test" })
+            }
+            fn list(&self, _: &str) -> Result<Vec<SnapshotInfo>, SnapperError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let dir = TempDir::new().expect("tempdir");
+        let state_path = dir.path().join("state.toml");
+        let plan_id = write_state_with_history(&state_path, 7);
+
+        let nickel = MockNickel::new();
+        let probe = Box::new(MockProbe::with_state(empty_probed()));
+        let engine = Engine::new(Box::new(nickel), probe, PathBuf::from("/cfg-repo"));
+        let ctx = RunContext {
+            engine,
+            state_path: state_path.clone(),
+            fallback_host: "forge".to_owned(),
+            pacman: Box::new(MockPacman::new()),
+            cargo: Box::new(MockCargo::new()),
+            systemd: Box::new(MockSystemd::new()),
+            snapper: Box::new(FailingSnapper),
+        };
+        let args = args_for_rollback(plan_id, state_path);
+        let env = dispatch(&args, &ctx);
+
+        let err = env.error.expect("error");
+        assert_eq!(err.code, "ROLLBACK_SNAPPER");
+        assert_eq!(err.exit_code, 4);
+        assert_eq!(err.class, "apply-recoverable");
     }
 
     #[test]
