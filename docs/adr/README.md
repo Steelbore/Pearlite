@@ -27,3 +27,4 @@ under Plan §9.6 but not gating any milestone exit.
 | [ADR-0008](./0008-msrv-bump-policy.md) | MSRV bump policy | M2 W1 |
 | [ADR-0009](./0009-cachyos-ci-runner.md) | CachyOS-fidelity CI runner choice | M2 W1 |
 | [ADR-0010](./0010-plan-file-schema-stability.md) | `--plan-file` schema-stability rules | M2 W3 |
+| [ADR-0011](./0011-prune-drift-threshold.md) | `apply --prune` drift threshold | M2 W3 |

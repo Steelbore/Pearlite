@@ -12,11 +12,14 @@
 #      propose remove via --prune; without --prune we expect drift only,
 #      so this script asserts state-managed → drift surfaced).
 #
-# The actual removal action emission is gated on `--prune`, which lands
-# in a follow-up M2 W3 PR. Until then, vm-03 verifies the plan-side
-# drift classification: removing `tree` from the host file with `tree`
-# present in `state.managed.pacman` produces a drift entry of type
-# `forgotten_package`.
+# The actual removal action emission is gated on `--prune` per
+# ADR-0011. vm-03 (this script) verifies the plan-side drift
+# classification only — that removing `tree` from the host file with
+# `tree` present in `state.managed.pacman` produces a drift entry.
+# Asserting the `--prune` removal path end-to-end belongs in a
+# dedicated vm-07-prune scenario when the post-M6 retrospective
+# validates the threshold default; until then the unit tests in
+# pearlite-cli::dispatch cover the threshold guard.
 #
 # Mutating: requires PEARLITE_VM_TEST=1.
 #

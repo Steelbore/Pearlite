@@ -72,7 +72,7 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
                     return Envelope::failure(metadata_at(None), payload);
                 }
             };
-            match ctx.engine.plan(&host_path, &state) {
+            match ctx.engine.plan(&host_path, &state, false) {
                 Ok(plan) => match serde_json::to_value(&plan) {
                     Ok(v) => Envelope::success(metadata_at(Some(plan.host)), v),
                     Err(e) => Envelope::failure(
@@ -97,15 +97,21 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
             plans_dir,
             dry_run,
             plan_file,
+            prune,
+            prune_threshold,
         } => dispatch_apply(
             args,
             ctx,
-            host_file.as_ref(),
-            snapper_config,
-            failures_dir.as_ref(),
-            plans_dir.as_ref(),
-            *dry_run,
-            plan_file.as_ref(),
+            &ApplyOpts {
+                host_file: host_file.as_ref(),
+                snapper_config,
+                failures_dir: failures_dir.as_ref(),
+                plans_dir: plans_dir.as_ref(),
+                dry_run: *dry_run,
+                plan_file: plan_file.as_ref(),
+                prune: *prune,
+                prune_threshold: *prune_threshold,
+            },
             &metadata_at,
         ),
         Command::Rollback {
@@ -139,48 +145,88 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
 /// Plan → apply → render. Pulled out of [`dispatch`] so the top-level
 /// match stays under clippy's `too_many_lines` limit; logic is
 /// otherwise identical to the inline form.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "dispatch_apply mirrors Command::Apply's variant fields plus the \
-              shared metadata closure; collapsing them would just hide what's \
-              load-bearing"
-)]
+/// Bundle of `pearlite apply` options for [`dispatch_apply`].
+///
+/// Pulled out of [`dispatch`] as a struct so the helper signature
+/// stays under clippy's `too_many_arguments` ceiling and so future
+/// flags don't keep widening the function.
+struct ApplyOpts<'a> {
+    host_file: Option<&'a PathBuf>,
+    snapper_config: &'a str,
+    failures_dir: Option<&'a PathBuf>,
+    plans_dir: Option<&'a PathBuf>,
+    dry_run: bool,
+    plan_file: Option<&'a PathBuf>,
+    prune: bool,
+    prune_threshold: usize,
+}
+
 fn dispatch_apply(
     args: &Args,
     ctx: &RunContext,
-    host_file: Option<&PathBuf>,
-    snapper_config: &str,
-    failures_dir: Option<&PathBuf>,
-    plans_dir: Option<&PathBuf>,
-    dry_run: bool,
-    plan_file: Option<&PathBuf>,
+    opts: &ApplyOpts<'_>,
     metadata_at: &dyn Fn(Option<String>) -> Metadata,
 ) -> Envelope {
-    let host_path = host_file
+    let host_path = opts
+        .host_file
         .cloned()
         .unwrap_or_else(|| default_host_file(&args.config_dir, &ctx.fallback_host));
-    let failures_dir = failures_dir
+    let failures_dir = opts
+        .failures_dir
         .cloned()
         .unwrap_or_else(|| default_failures_dir(&ctx.state_path));
-    let plans_dir = plans_dir
+    let plans_dir = opts
+        .plans_dir
         .cloned()
         .unwrap_or_else(|| default_plans_dir(&ctx.state_path));
     let state = match read_state_strict(&ctx.state_path) {
         Ok(s) => s,
         Err(payload) => return Envelope::failure(metadata_at(None), payload),
     };
-    let plan = match plan_file {
+    let plan = match opts.plan_file {
         Some(path) => match load_plan_file(path) {
             Ok(p) => p,
             Err(payload) => return Envelope::failure(metadata_at(None), payload),
         },
-        None => match ctx.engine.plan(&host_path, &state) {
+        None => match ctx.engine.plan(&host_path, &state, opts.prune) {
             Ok(p) => p,
             Err(e) => return Envelope::failure(metadata_at(None), engine_error_payload(&e)),
         },
     };
     let host = plan.host.clone();
     let plan_id = plan.plan_id;
+
+    // ADR-0011 threshold guard. Counts forgotten removals (the prune
+    // surface), NOT every PacmanRemove / CargoUninstall — declared
+    // removes via [remove] policy are out of scope for the threshold.
+    if opts.prune {
+        let pruned = count_pruned_packages(&plan);
+        if pruned > opts.prune_threshold {
+            return Envelope::failure(
+                metadata_at(Some(host)),
+                ErrorPayload {
+                    code: "PRUNE_THRESHOLD_EXCEEDED".to_owned(),
+                    class: "preflight".to_owned(),
+                    exit_code: 2,
+                    message: format!(
+                        "{pruned} forgotten packages would be removed; \
+                         threshold is {} (ADR-0011)",
+                        opts.prune_threshold,
+                    ),
+                    hint: format!(
+                        "audit the diff via `pearlite plan`, then re-run with \
+                         `--prune-threshold {pruned}` if the removals are intentional",
+                    ),
+                    details: serde_json::json!({
+                        "prune_count": pruned,
+                        "prune_threshold": opts.prune_threshold,
+                        "plan_id": plan_id,
+                    }),
+                },
+            );
+        }
+    }
+
     // Persist the plan before any side effects. Best-effort: the
     // `[[history]]` entry that `apply_plan` writes already carries the
     // plan_id, so a missing JSON file does not break the apply or any
@@ -192,7 +238,7 @@ fn dispatch_apply(
     // is still useful: it ensures a uniformly-located forensic copy
     // even if the operator passed an out-of-tree file.
     persist_plan(&plan, &plans_dir);
-    if dry_run {
+    if opts.dry_run {
         return match serde_json::to_value(&plan) {
             Ok(v) => Envelope::success(metadata_at(Some(host)), v),
             Err(e) => Envelope::failure(
@@ -214,7 +260,7 @@ fn dispatch_apply(
         ctx.cargo.as_ref(),
         ctx.systemd.as_ref(),
         ctx.snapper.as_ref(),
-        snapper_config,
+        opts.snapper_config,
         &ctx.state_path,
         &failures_dir,
     ) {
@@ -273,6 +319,21 @@ fn load_plan_file(path: &Path) -> Result<pearlite_diff::Plan, ErrorPayload> {
             .to_owned(),
         details: serde_json::Value::Null,
     })
+}
+
+/// Sum the package counts across `PacmanRemove` and `CargoUninstall`
+/// actions in `plan`. With `prune: false` this is always 0 because no
+/// other code path currently emits removal actions; the threshold
+/// check in [`dispatch_apply`] runs only on the prune branch.
+fn count_pruned_packages(plan: &pearlite_diff::Plan) -> usize {
+    plan.actions
+        .iter()
+        .map(|a| match a {
+            pearlite_diff::Action::PacmanRemove { packages } => packages.len(),
+            pearlite_diff::Action::CargoUninstall { .. } => 1,
+            _ => 0,
+        })
+        .sum()
 }
 
 /// Best-effort persist `plan` to `<plans_dir>/<plan-id>.json`.
@@ -929,6 +990,8 @@ package = "linux-cachyos"
                 plans_dir: None,
                 dry_run: false,
                 plan_file: None,
+                prune: false,
+                prune_threshold: 5,
             },
         }
     }
@@ -945,6 +1008,8 @@ package = "linux-cachyos"
                 plans_dir: None,
                 dry_run: true,
                 plan_file: None,
+                prune: false,
+                prune_threshold: 5,
             },
         }
     }
@@ -961,6 +1026,30 @@ package = "linux-cachyos"
                 plans_dir: None,
                 dry_run: false,
                 plan_file: Some(plan_file),
+                prune: false,
+                prune_threshold: 5,
+            },
+        }
+    }
+
+    fn args_for_apply_prune(
+        host_file: PathBuf,
+        state_file: PathBuf,
+        prune_threshold: usize,
+    ) -> Args {
+        Args {
+            format: OutputFormat::Json,
+            config_dir: PathBuf::from("/etc/pearlite/repo"),
+            state_file,
+            command: Command::Apply {
+                host_file: Some(host_file),
+                snapper_config: "root".to_owned(),
+                failures_dir: None,
+                plans_dir: None,
+                dry_run: false,
+                plan_file: None,
+                prune: true,
+                prune_threshold,
             },
         }
     }
@@ -1207,6 +1296,138 @@ package = "linux-cachyos"
         let err = env.error.expect("error");
         assert_eq!(err.code, "PLAN_FILE_PARSE_FAILED");
         assert_eq!(err.exit_code, 2);
+    }
+
+    /// Build a `RunContext` whose probe reports `forgotten_pkg` as
+    /// explicitly installed, and whose `state.toml` lists it under
+    /// `managed.pacman`. With `MINIMAL_HOST` (no `packages.core`), the
+    /// classifier puts `forgotten_pkg` in the forgotten bucket — the
+    /// substrate every prune-threshold test needs.
+    fn forgotten_pacman_ctx(
+        host_path: PathBuf,
+        state_path: PathBuf,
+        forgotten_pkg: &str,
+    ) -> RunContext {
+        let mut nickel = MockNickel::new();
+        nickel.seed(host_path, MINIMAL_HOST);
+        let probe = Box::new(MockProbe::with_state(ProbedState {
+            probed_at: OffsetDateTime::from_unix_timestamp(1_777_000_000).expect("ts"),
+            host: HostInfo {
+                hostname: "forge".to_owned(),
+            },
+            pacman: Some(PacmanInventory {
+                explicit: [forgotten_pkg.to_owned()].into_iter().collect(),
+                ..Default::default()
+            }),
+            cargo: Some(CargoInventory::default()),
+            config_files: None,
+            services: Some(ServiceInventory::default()),
+            kernel: KernelInfo::default(),
+        }));
+        let engine = Engine::new(Box::new(nickel), probe, PathBuf::from("/cfg-repo"));
+
+        // state.toml flags forgotten_pkg as previously managed.
+        let store = StateStore::new(state_path.clone());
+        let state = State {
+            schema_version: SCHEMA_VERSION,
+            host: "forge".to_owned(),
+            tool_version: "0.1.0".to_owned(),
+            config_dir: PathBuf::from("/cfg"),
+            last_apply: None,
+            last_modified: None,
+            managed: pearlite_state::Managed {
+                pacman: vec![forgotten_pkg.to_owned()],
+                ..Default::default()
+            },
+            adopted: pearlite_state::Adopted::default(),
+            history: Vec::new(),
+            reconciliations: Vec::new(),
+            failures: Vec::new(),
+            reserved: std::collections::BTreeMap::new(),
+        };
+        store.write_atomic(&state).expect("write state");
+
+        RunContext {
+            engine,
+            state_path,
+            fallback_host: "forge".to_owned(),
+            pacman: Box::new(MockPacman::new()),
+            cargo: Box::new(MockCargo::new()),
+            systemd: Box::new(MockSystemd::new()),
+            snapper: Box::new(MockSnapper::new()),
+        }
+    }
+
+    #[test]
+    fn apply_prune_executes_pacman_remove_under_threshold() {
+        let dir = TempDir::new().expect("tempdir");
+        let host = dir.path().join("forge.ncl");
+        let state_path = dir.path().join("state.toml");
+        let ctx = forgotten_pacman_ctx(host.clone(), state_path.clone(), "xterm");
+
+        let env = dispatch(&args_for_apply_prune(host, state_path, 5), &ctx);
+
+        assert!(env.error.is_none(), "expected success, got {env:?}");
+        let data = env.data.expect("data");
+        assert_eq!(
+            data.get("actions_executed")
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "exactly one PacmanRemove action runs (xterm)"
+        );
+    }
+
+    #[test]
+    fn apply_prune_above_threshold_yields_typed_error() {
+        let dir = TempDir::new().expect("tempdir");
+        let host = dir.path().join("forge.ncl");
+        let state_path = dir.path().join("state.toml");
+        let ctx = forgotten_pacman_ctx(host.clone(), state_path.clone(), "xterm");
+
+        // Threshold of 0 forces every forgotten removal to trip the
+        // guard.
+        let env = dispatch(&args_for_apply_prune(host, state_path, 0), &ctx);
+
+        let err = env.error.expect("error");
+        assert_eq!(err.code, "PRUNE_THRESHOLD_EXCEEDED");
+        assert_eq!(err.exit_code, 2);
+        assert_eq!(err.class, "preflight");
+        assert!(err.message.contains("threshold is 0"));
+        // details carries the count + threshold for agents to inspect.
+        assert_eq!(
+            err.details
+                .get("prune_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            err.details
+                .get("prune_threshold")
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn apply_without_prune_ignores_forgotten_packages() {
+        // Same forgotten state, but apply WITHOUT --prune. The forgotten
+        // package surfaces as drift only, not a removal action — so apply
+        // succeeds with actions_executed == 0.
+        let dir = TempDir::new().expect("tempdir");
+        let host = dir.path().join("forge.ncl");
+        let state_path = dir.path().join("state.toml");
+        let ctx = forgotten_pacman_ctx(host.clone(), state_path.clone(), "xterm");
+
+        let env = dispatch(&args_for_apply(host, state_path), &ctx);
+
+        assert!(env.error.is_none(), "expected success, got {env:?}");
+        let data = env.data.expect("data");
+        assert_eq!(
+            data.get("actions_executed")
+                .and_then(serde_json::Value::as_u64),
+            Some(0),
+            "without --prune, forgotten is drift only, no removal action"
+        );
     }
 
     #[test]

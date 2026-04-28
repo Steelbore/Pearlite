@@ -26,6 +26,13 @@ use uuid::Uuid;
 /// path (relative to the user's repo) to its hex-encoded SHA-256. The
 /// engine computes these once via `pearlite-fs::sha256_file` and
 /// passes them in; this crate is forbidden from doing I/O per Plan §6.3.
+///
+/// `prune` toggles ADR-0011 forgotten-package removal. When `false`
+/// (the default), forgotten packages surface only as drift entries.
+/// When `true`, the plan additionally carries `PacmanRemove` /
+/// `CargoUninstall` actions for every forgotten package; the
+/// drift-threshold guard that prevents mass-deletion lives at the
+/// CLI boundary, not here.
 #[must_use]
 pub fn plan(
     declared: &DeclaredState,
@@ -34,6 +41,7 @@ pub fn plan(
     declared_source_sha256: &BTreeMap<PathBuf, String>,
     plan_id: Uuid,
     generated_at: OffsetDateTime,
+    prune: bool,
 ) -> Plan {
     let mut actions = Vec::new();
     let mut drift = Vec::new();
@@ -47,6 +55,9 @@ pub fn plan(
     };
     pacman_actions(&pacman_class, &mut actions);
     pacman_drift(&pacman_class, &mut drift);
+    if prune {
+        pacman_prune_actions(&pacman_class, &mut actions);
+    }
 
     // Phase 2 + 3 (cargo half): install + drift.
     let cargo_class = if let Some(probed_cargo) = probed.cargo.as_ref() {
@@ -56,6 +67,9 @@ pub fn plan(
     };
     cargo_actions(&cargo_class, &mut actions);
     cargo_drift(&cargo_class, &mut drift);
+    if prune {
+        cargo_prune_actions(&cargo_class, &mut actions);
+    }
 
     // Phase 4 + 6: config writes + restarts. Plus drift surfacing for
     // changed-on-disk files.
@@ -120,6 +134,29 @@ fn pacman_drift(class: &crate::PacmanClassification, drift: &mut Vec<DriftItem>)
             category: DriftCategory::ManualPackage,
             identifier: pkg.clone(),
             details: "declared once; pearlite apply --prune would remove it".to_owned(),
+        });
+    }
+}
+
+/// ADR-0011: convert forgotten pacman packages into a single
+/// `PacmanRemove` action. One action per plan keeps the apply-side
+/// transaction atomic — paru runs `pacman -Rs <list>` once.
+fn pacman_prune_actions(class: &crate::PacmanClassification, actions: &mut Vec<Action>) {
+    if class.forgotten.is_empty() {
+        return;
+    }
+    actions.push(Action::PacmanRemove {
+        packages: class.forgotten.clone(),
+    });
+}
+
+/// ADR-0011: one `CargoUninstall` action per forgotten cargo crate.
+/// Cargo lacks a multi-uninstall primitive, so per-crate is the only
+/// option.
+fn cargo_prune_actions(class: &crate::CargoClassification, actions: &mut Vec<Action>) {
+    for crate_name in &class.forgotten {
+        actions.push(Action::CargoUninstall {
+            crate_name: crate_name.clone(),
         });
     }
 }
@@ -323,6 +360,7 @@ mod tests {
             &BTreeMap::new(),
             fixed_uuid(),
             fixed_time(),
+            false,
         );
         assert!(p.actions.is_empty());
         assert!(p.drift.is_empty());
@@ -348,6 +386,7 @@ mod tests {
             &BTreeMap::new(),
             fixed_uuid(),
             fixed_time(),
+            false,
         );
         assert!(p.actions.is_empty(), "no actions when fully in sync");
         assert!(p.drift.is_empty());
@@ -367,6 +406,7 @@ mod tests {
             &BTreeMap::new(),
             fixed_uuid(),
             fixed_time(),
+            false,
         );
         // Three install actions, each grouped by repo.
         let installs: Vec<&Action> = p
@@ -407,6 +447,7 @@ mod tests {
             &BTreeMap::new(),
             fixed_uuid(),
             fixed_time(),
+            false,
         );
         assert_eq!(p.drift.len(), 1);
         assert_eq!(p.drift[0].category, DriftCategory::ManualPackage);
@@ -429,6 +470,7 @@ mod tests {
             &BTreeMap::new(),
             fixed_uuid(),
             fixed_time(),
+            false,
         );
         assert_eq!(p.drift.len(), 1);
         assert_eq!(p.drift[0].category, DriftCategory::ServiceState);
@@ -475,6 +517,7 @@ mod tests {
             &sha,
             fixed_uuid(),
             fixed_time(),
+            false,
         );
         assert!(
             p.actions
@@ -487,6 +530,132 @@ mod tests {
                 .iter()
                 .any(|d| d.category == DriftCategory::ConfigFile && d.identifier == "/etc/hosts"),
             "drift must mention the target"
+        );
+    }
+
+    /// Build a state with `forgotten_pacman` flagged as previously
+    /// managed and `forgotten_cargo` likewise, so the diff classifier
+    /// will route the corresponding installed-but-not-declared
+    /// packages into the `forgotten` bucket.
+    fn state_with_forgotten(forgotten_pacman: Vec<String>, forgotten_cargo: Vec<String>) -> State {
+        let mut state = empty_state();
+        state.managed.pacman = forgotten_pacman;
+        state.managed.cargo = forgotten_cargo;
+        state
+    }
+
+    #[test]
+    fn prune_off_emits_drift_only_no_remove_actions() {
+        let state = state_with_forgotten(vec!["xterm".to_owned()], vec![]);
+        let probed = ProbedState {
+            pacman: Some(PacmanInventory {
+                explicit: ["xterm".to_owned()].into_iter().collect(),
+                ..Default::default()
+            }),
+            ..probed_minimal()
+        };
+        let p = plan(
+            &declared_minimal(),
+            &probed,
+            &state,
+            &BTreeMap::new(),
+            fixed_uuid(),
+            fixed_time(),
+            false,
+        );
+        assert!(
+            !p.actions
+                .iter()
+                .any(|a| matches!(a, Action::PacmanRemove { .. })),
+            "prune=false must not emit PacmanRemove, got {:?}",
+            p.actions
+        );
+        assert_eq!(p.drift.len(), 1, "forgotten still surfaces as drift");
+    }
+
+    #[test]
+    fn prune_on_emits_pacman_remove_for_forgotten() {
+        let state = state_with_forgotten(vec!["xterm".to_owned(), "old-pkg".to_owned()], vec![]);
+        let probed = ProbedState {
+            pacman: Some(PacmanInventory {
+                explicit: ["xterm".to_owned(), "old-pkg".to_owned()]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            }),
+            ..probed_minimal()
+        };
+        let p = plan(
+            &declared_minimal(),
+            &probed,
+            &state,
+            &BTreeMap::new(),
+            fixed_uuid(),
+            fixed_time(),
+            true,
+        );
+        let removes: Vec<&Action> = p
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::PacmanRemove { .. }))
+            .collect();
+        assert_eq!(removes.len(), 1, "exactly one bundled PacmanRemove action");
+        if let Action::PacmanRemove { packages } = removes[0] {
+            assert_eq!(packages.len(), 2);
+            assert!(packages.contains(&"xterm".to_owned()));
+            assert!(packages.contains(&"old-pkg".to_owned()));
+        }
+    }
+
+    #[test]
+    fn prune_on_emits_cargo_uninstall_per_forgotten_crate() {
+        let state = state_with_forgotten(vec![], vec!["zellij".to_owned(), "lsd".to_owned()]);
+        let probed = ProbedState {
+            cargo: Some(CargoInventory {
+                crates: [
+                    ("zellij".to_owned(), "0.40.1".to_owned()),
+                    ("lsd".to_owned(), "1.1.5".to_owned()),
+                ]
+                .into_iter()
+                .collect(),
+            }),
+            ..probed_minimal()
+        };
+        let p = plan(
+            &declared_minimal(),
+            &probed,
+            &state,
+            &BTreeMap::new(),
+            fixed_uuid(),
+            fixed_time(),
+            true,
+        );
+        let uninstalls: Vec<&Action> = p
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::CargoUninstall { .. }))
+            .collect();
+        assert_eq!(
+            uninstalls.len(),
+            2,
+            "one CargoUninstall per forgotten crate (no batch primitive)"
+        );
+    }
+
+    #[test]
+    fn prune_on_with_no_forgotten_emits_no_remove_actions() {
+        let p = plan(
+            &declared_minimal(),
+            &probed_minimal(),
+            &empty_state(),
+            &BTreeMap::new(),
+            fixed_uuid(),
+            fixed_time(),
+            true,
+        );
+        assert!(
+            p.actions.is_empty(),
+            "no forgotten ⇒ no actions even with prune"
         );
     }
 
@@ -509,6 +678,7 @@ mod tests {
                 &BTreeMap::new(),
                 fixed_uuid(),
                 fixed_time(),
+                false,
             );
             let p2 = plan(
                 &declared,
@@ -517,6 +687,7 @@ mod tests {
                 &BTreeMap::new(),
                 fixed_uuid(),
                 fixed_time(),
+                false,
             );
             prop_assert_eq!(p1, p2);
         }
