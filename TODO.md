@@ -62,22 +62,22 @@
 ## M2 — Apply Engine (3 weeks)
 
 ### Week 1 — Apply-side adapters
-- [ ] `pearlite-pacman`: install / remove / sync_databases
-- [ ] `pearlite-cargo`: install / uninstall
-- [ ] `pearlite-systemd`: enable / disable / mask / restart
-- [ ] `pearlite-snapper`: create / rollback / list
+- [✓] `pearlite-pacman`: install / remove / sync_databases (PR #22)
+- [✓] `pearlite-cargo`: install / uninstall (PR #23)
+- [✓] `pearlite-systemd`: enable / disable / mask / restart (PR #24)
+- [✓] `pearlite-snapper`: create / rollback / list (PR #21)
 
 ### Week 2 — Engine orchestration
-- [ ] `pearlite-engine::apply()` — all seven phases (no phase 7 yet)
-- [ ] `Action::within_phase_key()` and `Action::failure_coherence()` for every variant
-- [ ] Failure record writing per PRD §11.4
-- [ ] `pearlite-engine::rollback()`
+- [✓] `pearlite-engine::apply()` — phases 1..6 + 8 + 9 (phase 7 user env in M3) (PRs #27 / #28 / #29)
+- [✓] `Action::within_phase_key()` and `Action::failure_coherence()` for every variant (PRs #25 / #26)
+- [✓] Failure record writing per PRD §11.4 (PR #30)
+- [✓] `pearlite-engine::rollback()` (PR #31)
 
 ### Week 3 — CLI integration & VM tests
-- [ ] `pearlite apply`, `apply --dry-run`, `apply --plan-file`, `apply --prune`
-- [ ] `pearlite rollback`, `gen list`, `gen show`
-- [ ] VM scenarios: `vm-02` installs, `vm-03` removes, `vm-04` config write, `vm-05` rollback, `vm-06` failure record
-- [ ] Tag `m2-exit`
+- [✓] `pearlite apply`, `apply --dry-run`, `apply --plan-file`, `apply --prune` (PRs #32 / #35 / #39 / #42)
+- [✓] `pearlite rollback`, `gen list`, `gen show` (PRs #33 / #34 / #37 / #38)
+- [✓] VM scenarios: `vm-02` installs, `vm-03` removes, `vm-04` config write, `vm-05` rollback, `vm-06` failure record (PRs #40 / #41)
+- [~] Tag `m2-exit` (signed tag from this commit)
 
 ---
 
