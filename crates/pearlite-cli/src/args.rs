@@ -92,6 +92,17 @@ pub enum Command {
         /// build (ADR-0010 §Decision).
         #[arg(long, conflicts_with = "dry_run")]
         plan_file: Option<PathBuf>,
+        /// Remove packages that were once Pearlite-managed but are no
+        /// longer declared (PRD §7.3 "Forgotten" classification). Per
+        /// ADR-0011, the CLI refuses to proceed when the forgotten
+        /// count exceeds `--prune-threshold`.
+        #[arg(long, conflicts_with = "plan_file")]
+        prune: bool,
+        /// Maximum number of forgotten packages `--prune` will remove
+        /// without explicit override. Default is 5 per ADR-0011 §3;
+        /// the post-M6 retrospective revisits the value.
+        #[arg(long, default_value_t = 5, requires = "prune")]
+        prune_threshold: usize,
     },
     /// Inspect Pearlite's apply history (a.k.a. generations).
     ///

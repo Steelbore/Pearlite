@@ -68,13 +68,19 @@ impl Engine {
     ///    `pearlite_fs::sha256_file`.
     /// 6. Compose the plan via `pearlite_diff::plan`.
     ///
+    /// `prune` toggles ADR-0011 forgotten-package removal: when
+    /// `false` (default), forgotten packages surface as drift only;
+    /// when `true`, the plan additionally carries `PacmanRemove` /
+    /// `CargoUninstall` actions for them. The drift-threshold guard
+    /// that prevents mass-deletion lives at the CLI boundary.
+    ///
     /// # Errors
     /// - [`EngineError::Nickel`] — evaluator failed.
     /// - [`EngineError::ContractViolations`] — schema invariants
     ///   broken.
     /// - [`EngineError::Probe`] — adapter or I/O failure during probe.
     /// - [`EngineError::Fs`] — config-source hashing failed.
-    pub fn plan(&self, host_file: &Path, state: &State) -> Result<Plan, EngineError> {
+    pub fn plan(&self, host_file: &Path, state: &State, prune: bool) -> Result<Plan, EngineError> {
         let declared = pearlite_nickel::load_host(host_file, &*self.nickel)?;
         pearlite_schema::validate(&declared).map_err(EngineError::ContractViolations)?;
 
@@ -90,6 +96,7 @@ impl Engine {
             &declared_source_sha256,
             Uuid::now_v7(),
             OffsetDateTime::now_utc(),
+            prune,
         ))
     }
 
@@ -203,7 +210,7 @@ package = "linux-cachyos"
         let host = dir.path().join("forge.ncl");
         let probe = Box::new(MockProbe::with_state(empty_probed()));
         let engine = make_engine_with(probe, host.clone());
-        let p = engine.plan(&host, &empty_state()).expect("plan");
+        let p = engine.plan(&host, &empty_state(), false).expect("plan");
         assert!(p.actions.is_empty());
         assert!(p.drift.is_empty());
         assert_eq!(p.host, "forge");
@@ -224,7 +231,7 @@ package = "linux-cachyos"
         let probe = Box::new(MockProbe::with_state(probed));
 
         let engine = make_engine_with(probe, host.clone());
-        let p = engine.plan(&host, &empty_state()).expect("plan");
+        let p = engine.plan(&host, &empty_state(), false).expect("plan");
         assert_eq!(p.drift.len(), 1);
         assert_eq!(p.drift[0].identifier, "vim");
     }
@@ -237,7 +244,9 @@ package = "linux-cachyos"
         let nickel = MockNickel::new();
         let probe = Box::new(MockProbe::with_state(empty_probed()));
         let engine = Engine::new(Box::new(nickel), probe, PathBuf::from("/cfg-repo"));
-        let err = engine.plan(&host, &empty_state()).expect_err("must fail");
+        let err = engine
+            .plan(&host, &empty_state(), false)
+            .expect_err("must fail");
         assert!(matches!(err, EngineError::Nickel(_)), "got {err:?}");
     }
 
@@ -263,7 +272,9 @@ package = "linux-cachyos"
         nickel.seed(host.clone(), bogus);
         let probe = Box::new(MockProbe::with_state(empty_probed()));
         let engine = Engine::new(Box::new(nickel), probe, PathBuf::from("/cfg-repo"));
-        let err = engine.plan(&host, &empty_state()).expect_err("must fail");
+        let err = engine
+            .plan(&host, &empty_state(), false)
+            .expect_err("must fail");
         assert!(
             matches!(err, EngineError::ContractViolations(_)),
             "got {err:?}"
@@ -277,8 +288,8 @@ package = "linux-cachyos"
         let probe = Box::new(MockProbe::with_state(empty_probed()));
         let engine = make_engine_with(probe, host.clone());
 
-        let p1 = engine.plan(&host, &empty_state()).expect("plan 1");
-        let p2 = engine.plan(&host, &empty_state()).expect("plan 2");
+        let p1 = engine.plan(&host, &empty_state(), false).expect("plan 1");
+        let p2 = engine.plan(&host, &empty_state(), false).expect("plan 2");
 
         assert_ne!(p1.plan_id, p2.plan_id, "plan_id must be fresh per call");
         // generated_at is also fresh; on a fast machine it might happen
