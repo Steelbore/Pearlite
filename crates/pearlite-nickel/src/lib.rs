@@ -9,11 +9,13 @@
 //! capture + delegation to [`pearlite_schema::from_resolved_toml`] for
 //! the actual deserialisation.
 
+mod emit;
 mod errors;
 mod live;
 #[cfg(any(test, feature = "test-mocks"))]
 mod mock;
 
+pub use emit::emit_host;
 pub use errors::NickelError;
 pub use live::{LiveNickel, NickelEvaluator};
 

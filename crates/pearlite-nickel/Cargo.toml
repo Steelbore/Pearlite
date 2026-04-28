@@ -17,3 +17,6 @@ test-mocks = []
 [dependencies]
 pearlite-schema = { path = "../pearlite-schema", version = "0.1" }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+time = { workspace = true }
