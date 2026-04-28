@@ -217,14 +217,13 @@ mod tests {
     /// Produce a fixture installer script and its sha256, plus a
     /// [`LiveNixInstaller`] with `nix` pointed at a non-existent path
     /// so `nix_already_installed` returns false (forces the script
-    /// path).
-    fn installer_with_script(content: &[u8]) -> (LiveNixInstaller, std::path::PathBuf, String) {
+    /// path). Returns the [`TempDir`] guard so the caller keeps it
+    /// alive for the duration of the test.
+    fn installer_with_script(
+        content: &[u8],
+    ) -> (LiveNixInstaller, std::path::PathBuf, String, TempDir) {
         let dir = TempDir::new().expect("tempdir");
-        let dir_path = dir.path().to_path_buf();
-        // Leak the TempDir so the path stays valid for the test;
-        // the OS reclaims at process exit.
-        std::mem::forget(dir);
-        let script = dir_path.join("nix-installer.sh");
+        let script = dir.path().join("nix-installer.sh");
         std::fs::write(&script, content).expect("write script");
         let sha = hex_encode(&pearlite_fs::sha256_bytes(content));
         let installer = LiveNixInstaller::with_binaries(
@@ -234,13 +233,13 @@ mod tests {
             // we test only the SHA path.
             "/bin/sh",
         );
-        (installer, script, sha)
+        (installer, script, sha, dir)
     }
 
     #[test]
     fn sha256_mismatch_refuses_to_execute() {
         let content = b"#!/bin/sh\necho 'should not run'\nexit 99\n";
-        let (installer, script, _real_sha) = installer_with_script(content);
+        let (installer, script, _real_sha, _guard) = installer_with_script(content);
 
         let bogus_sha = "0".repeat(64);
         let err = installer
@@ -298,7 +297,7 @@ mod tests {
     fn script_non_zero_exit_surfaces_as_script_failed() {
         // Script that always exits 17.
         let content = b"#!/bin/sh\nexit 17\n";
-        let (installer, script, sha) = installer_with_script(content);
+        let (installer, script, sha, _guard) = installer_with_script(content);
 
         let err = installer
             .install_if_missing(&script, &sha, &[])
@@ -314,7 +313,7 @@ mod tests {
         // Trivially-passing script stands in for the real Determinate
         // installer.
         let content = b"#!/bin/sh\nexit 0\n";
-        let (installer, script, sha) = installer_with_script(content);
+        let (installer, script, sha, _guard) = installer_with_script(content);
 
         let outcome = installer
             .install_if_missing(&script, &sha, &["--no-confirm"])
