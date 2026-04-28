@@ -467,12 +467,14 @@ dependencies = [
  "pearlite-nickel",
  "pearlite-pacman",
  "pearlite-schema",
+ "pearlite-snapper",
  "pearlite-state",
  "pearlite-systemd",
  "serde",
  "serde_json",
  "tempfile",
  "time",
+ "uuid",
 ]
 
 [[package]]
