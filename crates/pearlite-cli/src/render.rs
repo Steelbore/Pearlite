@@ -56,6 +56,15 @@ pub fn render_human(envelope: &Envelope, out: &mut dyn Write) -> std::io::Result
     if let Some(warnings) = data.get("warnings").and_then(|v| v.as_array()) {
         writeln!(out, "  warnings: {}", warnings.len())?;
     }
+    if let Some(executed) = data
+        .get("actions_executed")
+        .and_then(serde_json::Value::as_u64)
+    {
+        writeln!(out, "  actions executed: {executed}")?;
+    }
+    if let Some(generation) = data.get("generation").and_then(serde_json::Value::as_u64) {
+        writeln!(out, "  generation:       {generation}")?;
+    }
     Ok(())
 }
 

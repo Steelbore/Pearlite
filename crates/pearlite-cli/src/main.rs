@@ -9,6 +9,7 @@ use pearlite_cli::{Args, OutputFormat, RunContext, dispatch, render_human, rende
 use pearlite_engine::{Engine, LiveProbe};
 use pearlite_nickel::LiveNickel;
 use pearlite_pacman::LivePacman;
+use pearlite_snapper::LiveSnapper;
 use pearlite_systemd::LiveSystemd;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
@@ -33,6 +34,10 @@ fn main() -> ExitCode {
         engine,
         state_path: args.state_file.clone(),
         fallback_host,
+        pacman: Box::new(LivePacman::new()),
+        cargo: Box::new(LiveCargo::new()),
+        systemd: Box::new(LiveSystemd::new()),
+        snapper: Box::new(LiveSnapper::new()),
     };
 
     let envelope = dispatch(&args, &ctx);
