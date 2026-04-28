@@ -72,6 +72,11 @@ impl Action {
             // Phase 6 — restarts.
             Self::ServiceRestart { unit } => (0, unit.clone()),
 
+            // Phase 7 — user env: one switch per user, alphabetical
+            // by login name. Tied keys never happen because each user
+            // emits at most one UserEnvSwitch per plan.
+            Self::UserEnvSwitch { user, .. } => (0, user.clone()),
+
             // Phase 1 / 8 / post-fail — snapshots.
             Self::SnapshotCreate { label, phase } => {
                 let rank = match phase {
@@ -220,5 +225,22 @@ mod tests {
             scope: Scope::System,
         };
         assert!(a.within_phase_key() < b.within_phase_key());
+    }
+
+    #[test]
+    fn user_env_switch_orders_by_user() {
+        let alice = Action::UserEnvSwitch {
+            user: "alice".to_owned(),
+            config_path: PathBuf::from("/repo/users/alice"),
+            mode: pearlite_schema::HomeManagerMode::Standalone,
+            channel: "release-24.11".to_owned(),
+        };
+        let bob = Action::UserEnvSwitch {
+            user: "bob".to_owned(),
+            config_path: PathBuf::from("/repo/users/bob"),
+            mode: pearlite_schema::HomeManagerMode::Flake,
+            channel: "default".to_owned(),
+        };
+        assert!(alice.within_phase_key() < bob.within_phase_key());
     }
 }

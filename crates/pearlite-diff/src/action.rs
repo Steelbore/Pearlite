@@ -8,6 +8,7 @@
 //! `pearlite-engine::exec`. No dispatch tables, no trait objects in the
 //! hot path.
 
+use pearlite_schema::HomeManagerMode;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -96,6 +97,20 @@ pub enum Action {
     ServiceRestart {
         /// Unit name.
         unit: String,
+    },
+    /// Run `home-manager switch` for one declared user (PRD §8.2
+    /// phase 7). Emitted by the diff when the user's
+    /// `home_manager.enabled` is true and either the config-hash
+    /// drifts or no `[[managed.user_env]]` record exists yet.
+    UserEnvSwitch {
+        /// Login name to drop privileges to via `runuser`.
+        user: String,
+        /// Absolute path of the user's HM config directory.
+        config_path: PathBuf,
+        /// Home Manager invocation style (Standalone vs Flake).
+        mode: HomeManagerMode,
+        /// Channel/refspec for HM (e.g. `release-24.11`).
+        channel: String,
     },
     /// Take a Snapper snapshot.
     SnapshotCreate {

@@ -36,6 +36,8 @@ pub enum ApplyPhase {
     ServiceState,
     /// PRD §8.2 phase 6 — deduplicated service restarts.
     ServiceRestarts,
+    /// PRD §8.2 phase 7 — per-user `home-manager switch` runs.
+    UserEnv,
     /// PRD §8.2 phase 8 — post-apply snapshot.
     SnapshotPost,
     /// PRD §8.5 Class 3/4 — post-failure forensic snapshot.
@@ -64,6 +66,7 @@ impl Action {
                 ApplyPhase::ServiceState
             }
             Self::ServiceRestart { .. } => ApplyPhase::ServiceRestarts,
+            Self::UserEnvSwitch { .. } => ApplyPhase::UserEnv,
             Self::SnapshotCreate { phase, .. } => match phase {
                 Phase::Pre => ApplyPhase::SnapshotPre,
                 Phase::Post => ApplyPhase::SnapshotPost,
@@ -203,13 +206,25 @@ mod tests {
     }
 
     #[test]
+    fn user_env_switch_is_user_env_phase() {
+        let a = Action::UserEnvSwitch {
+            user: "alice".to_owned(),
+            config_path: PathBuf::from("/repo/users/alice"),
+            mode: pearlite_schema::HomeManagerMode::Standalone,
+            channel: "release-24.11".to_owned(),
+        };
+        assert_eq!(a.phase(), ApplyPhase::UserEnv);
+    }
+
+    #[test]
     fn phase_ordering_matches_prd_8_2_sequence() {
         assert!(ApplyPhase::SnapshotPre < ApplyPhase::Removals);
         assert!(ApplyPhase::Removals < ApplyPhase::Installs);
         assert!(ApplyPhase::Installs < ApplyPhase::ConfigWrites);
         assert!(ApplyPhase::ConfigWrites < ApplyPhase::ServiceState);
         assert!(ApplyPhase::ServiceState < ApplyPhase::ServiceRestarts);
-        assert!(ApplyPhase::ServiceRestarts < ApplyPhase::SnapshotPost);
+        assert!(ApplyPhase::ServiceRestarts < ApplyPhase::UserEnv);
+        assert!(ApplyPhase::UserEnv < ApplyPhase::SnapshotPost);
         assert!(ApplyPhase::SnapshotPost < ApplyPhase::SnapshotPostFail);
     }
 }

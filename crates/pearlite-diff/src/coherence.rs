@@ -74,6 +74,7 @@ impl Action {
             | Self::ServiceEnable { .. }
             | Self::ServiceDisable { .. }
             | Self::ServiceMask { .. }
+            | Self::UserEnvSwitch { .. }
             | Self::SnapshotCreate { .. } => FailureCoherence::Recoverable,
             Self::ServiceRestart { .. } => FailureCoherence::Incoherent,
         }
@@ -170,6 +171,17 @@ mod tests {
     fn service_mask_is_recoverable() {
         let a = Action::ServiceMask {
             unit: "telnet.service".to_owned(),
+        };
+        assert_eq!(a.failure_coherence(), FailureCoherence::Recoverable);
+    }
+
+    #[test]
+    fn user_env_switch_is_recoverable() {
+        let a = Action::UserEnvSwitch {
+            user: "alice".to_owned(),
+            config_path: PathBuf::from("/repo/users/alice"),
+            mode: pearlite_schema::HomeManagerMode::Standalone,
+            channel: "release-24.11".to_owned(),
         };
         assert_eq!(a.failure_coherence(), FailureCoherence::Recoverable);
     }
