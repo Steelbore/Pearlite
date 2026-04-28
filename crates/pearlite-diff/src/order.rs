@@ -234,12 +234,14 @@ mod tests {
             config_path: PathBuf::from("/repo/users/alice"),
             mode: pearlite_schema::HomeManagerMode::Standalone,
             channel: "release-24.11".to_owned(),
+            config_hash: String::new(),
         };
         let bob = Action::UserEnvSwitch {
             user: "bob".to_owned(),
             config_path: PathBuf::from("/repo/users/bob"),
             mode: pearlite_schema::HomeManagerMode::Flake,
             channel: "default".to_owned(),
+            config_hash: String::new(),
         };
         assert!(alice.within_phase_key() < bob.within_phase_key());
     }

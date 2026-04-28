@@ -286,6 +286,7 @@ fn user_env_actions(class: &crate::UserEnvClassification, actions: &mut Vec<Acti
             config_path: u.config_path.clone(),
             mode: u.mode,
             channel: u.channel.clone(),
+            config_hash: u.config_hash.clone(),
         });
     }
 }

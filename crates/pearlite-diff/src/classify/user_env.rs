@@ -40,6 +40,12 @@ pub struct UserToSwitch {
     pub mode: HomeManagerMode,
     /// Channel / refspec (`release-24.11`, etc.).
     pub channel: String,
+    /// Hex-encoded SHA-256 of the user's `config_path` at plan time.
+    /// Empty string when the engine couldn't compute one (defensive
+    /// arm: declared HM is enabled but `config_path` is missing on
+    /// disk). The apply path forwards whatever sits here into
+    /// `state.toml`'s `[[managed.user_env]].config_hash`.
+    pub config_hash: String,
 }
 
 /// Result of classifying user-env state.
@@ -106,6 +112,10 @@ pub fn classify_user_env(
                 config_path: std::path::PathBuf::from(&hm.config_path),
                 mode: hm.mode,
                 channel: hm.channel.clone(),
+                config_hash: declared_user_env_hash
+                    .get(&user.name)
+                    .cloned()
+                    .unwrap_or_default(),
             });
         }
     }
@@ -265,5 +275,16 @@ mod tests {
         assert_eq!(c.to_switch[0].config_path, PathBuf::from("users/alice"));
         assert_eq!(c.to_switch[0].mode, HomeManagerMode::Standalone);
         assert_eq!(c.to_switch[0].channel, "release-24.11");
+        // No declared hash supplied → empty sentinel.
+        assert_eq!(c.to_switch[0].config_hash, "");
+    }
+
+    #[test]
+    fn user_to_switch_carries_declared_hash_when_available() {
+        let users = vec![user_with_hm("alice", true, "release-24.11")];
+        let mut hashes = BTreeMap::new();
+        hashes.insert("alice".to_owned(), "abc123".to_owned());
+        let c = classify_user_env(&users, &hashes, &empty_state());
+        assert_eq!(c.to_switch[0].config_hash, "abc123");
     }
 }
