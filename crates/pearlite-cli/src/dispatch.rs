@@ -292,30 +292,30 @@ fn dispatch_gen(
             )
         }
         GenCommand::Show { plan_id, plans_dir } => {
-            match state.history.iter().find(|h| h.plan_id == *plan_id) {
-                Some(entry) => {
-                    let plans_dir = plans_dir
-                        .clone()
-                        .unwrap_or_else(|| default_plans_dir(&ctx.state_path));
-                    Envelope::success(
-                        metadata_at(Some(state.host.clone())),
-                        full_history_entry_view_with_plan(entry, &plans_dir),
-                    )
-                }
-                None => Envelope::failure(
+            let history_entry = state.history.iter().find(|h| h.plan_id == *plan_id);
+            let failure_ref = state.failures.iter().find(|f| f.plan_id == *plan_id);
+            if history_entry.is_none() && failure_ref.is_none() {
+                return Envelope::failure(
                     metadata_at(Some(state.host.clone())),
                     ErrorPayload {
                         code: "GEN_NOT_FOUND".to_owned(),
                         class: "preflight".to_owned(),
                         exit_code: 2,
                         message: format!(
-                            "no generation with plan_id {plan_id} in state.toml history"
+                            "no generation with plan_id {plan_id} in state.toml history or failures"
                         ),
                         hint: "pearlite gen list  # show known plan IDs and generations".to_owned(),
                         details: serde_json::Value::Null,
                     },
-                ),
+                );
             }
+            let plans_dir = plans_dir
+                .clone()
+                .unwrap_or_else(|| default_plans_dir(&ctx.state_path));
+            Envelope::success(
+                metadata_at(Some(state.host.clone())),
+                build_show_view(*plan_id, history_entry, failure_ref, &plans_dir),
+            )
         }
     }
 }
@@ -360,25 +360,61 @@ fn full_history_entry_view(entry: &pearlite_state::HistoryEntry) -> serde_json::
     })
 }
 
-/// Same as [`full_history_entry_view`] but additionally embeds the
-/// per-action plan content under `plan` if a JSON file for the entry
-/// exists at `<plans_dir>/<plan-id>.json`.
+/// Build the `gen show` envelope `data` for a `plan_id` that has at
+/// least one of: a history entry, a failure ref, or both.
 ///
-/// Missing or unparseable plan files surface as `plan: null` rather
-/// than an error: the history entry itself is the canonical record,
-/// and the JSON file is a forensic convenience that may legitimately
-/// be absent (e.g., a disk-full apply that failed before
-/// [`persist_plan`] could succeed).
-fn full_history_entry_view_with_plan(
-    entry: &pearlite_state::HistoryEntry,
+/// Output shape (every field always present, `null` when the
+/// underlying record is absent):
+///
+/// ```text
+/// {
+///   "plan_id":     <Uuid>,
+///   "history":     <HistoryEntry view> | null,
+///   "failure":     <FailureRef + parsed FailureRecord> | null,
+///   "plan":        <persisted Plan JSON> | null
+/// }
+/// ```
+///
+/// All four fields are emitted unconditionally so consumers can rely
+/// on field presence; `null` distinguishes "no such record" from "the
+/// JSON file was unreadable", whereas a missing field would conflate
+/// the two.
+fn build_show_view(
+    plan_id: uuid::Uuid,
+    history: Option<&pearlite_state::HistoryEntry>,
+    failure_ref: Option<&pearlite_state::FailureRef>,
     plans_dir: &Path,
 ) -> serde_json::Value {
-    let mut view = full_history_entry_view(entry);
-    let plan = load_plan_json(plans_dir, entry.plan_id);
-    if let serde_json::Value::Object(ref mut map) = view {
-        map.insert("plan".to_owned(), plan.unwrap_or(serde_json::Value::Null));
-    }
-    view
+    serde_json::json!({
+        "plan_id": plan_id,
+        "history": history.map_or(serde_json::Value::Null, full_history_entry_view),
+        "failure": failure_ref.map_or(serde_json::Value::Null, failure_view),
+        "plan": load_plan_json(plans_dir, plan_id).unwrap_or(serde_json::Value::Null),
+    })
+}
+
+/// Render a [`FailureRef`](pearlite_state::FailureRef) as JSON, with
+/// the parsed forensic [`FailureRecord`](pearlite_engine::FailureRecord)
+/// embedded under `record` when the JSON file at `record_path` is
+/// readable.
+///
+/// Missing or unparseable record files surface `record: null` —
+/// matching the [`load_plan_json`] convention. The `class` /
+/// `exit_code` / `failed_at` fields come from `state.toml` and remain
+/// authoritative even when the on-disk JSON is gone (e.g. the
+/// failures directory was wiped).
+fn failure_view(f: &pearlite_state::FailureRef) -> serde_json::Value {
+    let record = std::fs::read(&f.record_path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok());
+    serde_json::json!({
+        "plan_id": f.plan_id,
+        "failed_at": iso8601(f.failed_at),
+        "class": f.class,
+        "exit_code": f.exit_code,
+        "record_path": f.record_path,
+        "record": record.unwrap_or(serde_json::Value::Null),
+    })
 }
 
 /// Load `<plans_dir>/<plan-id>.json` and return its parsed content
@@ -1368,21 +1404,156 @@ package = "linux-cachyos"
 
         assert!(env.error.is_none(), "expected success, got {env:?}");
         let data = env.data.expect("data");
+        let history = data.get("history").expect("history field");
+        assert!(
+            !history.is_null(),
+            "history must be populated for a known plan_id"
+        );
         assert_eq!(
-            data.get("snapshot_pre")
+            history
+                .get("snapshot_pre")
                 .and_then(|v| v.get("id"))
                 .and_then(serde_json::Value::as_u64),
             Some(77)
         );
         assert_eq!(
-            data.get("snapshot_post")
+            history
+                .get("snapshot_post")
                 .and_then(|v| v.get("id"))
                 .and_then(serde_json::Value::as_u64),
             Some(78)
         );
         assert_eq!(
-            data.get("generation").and_then(serde_json::Value::as_u64),
+            history
+                .get("generation")
+                .and_then(serde_json::Value::as_u64),
             Some(1)
+        );
+        assert!(
+            data.get("failure").expect("failure field").is_null(),
+            "no failure for a successful apply"
+        );
+    }
+
+    /// Pre-seed `state_path` with a history-only state plus one
+    /// `FailureRef` pointing at a JSON record we also write to disk.
+    /// Returns `(plan_id, record_path)`.
+    fn write_state_with_failure(state_path: &Path, failures_dir: &Path) -> (uuid::Uuid, PathBuf) {
+        let plan_id = uuid::Uuid::now_v7();
+        std::fs::create_dir_all(failures_dir).expect("mkdir");
+        let record_path = failures_dir.join(format!("{}.json", plan_id.simple()));
+        // Write a forensic record JSON. Anything serde-parseable will do
+        // since gen show treats it as opaque Value.
+        let record = serde_json::json!({
+            "plan_id": plan_id,
+            "failed_at": "2026-04-28T00:00:00.000000000Z",
+            "class": 4,
+            "exit_code": 5,
+            "error_message": "service restart failed",
+            "failed_action_executed_index": 0,
+            "snapshot_pre": { "id": 9, "label": "pre-test", "created_at": "2026-04-28T00:00:00.000000000Z" },
+            "post_fail_snapshot": null,
+            "failed_action": { "ServiceRestart": { "unit": "sshd.service" } },
+        });
+        std::fs::write(
+            &record_path,
+            serde_json::to_vec_pretty(&record).expect("ser"),
+        )
+        .expect("write record");
+
+        let store = StateStore::new(state_path.to_path_buf());
+        let state = State {
+            schema_version: SCHEMA_VERSION,
+            host: "forge".to_owned(),
+            tool_version: "0.1.0".to_owned(),
+            config_dir: PathBuf::from("/cfg"),
+            last_apply: None,
+            last_modified: None,
+            managed: pearlite_state::Managed::default(),
+            adopted: pearlite_state::Adopted::default(),
+            history: Vec::new(),
+            reconciliations: Vec::new(),
+            failures: vec![pearlite_state::FailureRef {
+                plan_id,
+                failed_at: OffsetDateTime::from_unix_timestamp(1_777_000_000).expect("ts"),
+                class: 4,
+                exit_code: 5,
+                record_path: record_path.clone(),
+            }],
+            reserved: std::collections::BTreeMap::new(),
+        };
+        store.write_atomic(&state).expect("write state");
+        (plan_id, record_path)
+    }
+
+    #[test]
+    fn gen_show_embeds_failure_record_when_failure_ref_present() {
+        let dir = TempDir::new().expect("tempdir");
+        let state_path = dir.path().join("state.toml");
+        let failures_dir = dir.path().join("failures");
+        let (plan_id, _record_path) = write_state_with_failure(&state_path, &failures_dir);
+
+        let ctx = ctx_with(
+            dir.path().join("forge.ncl"),
+            MINIMAL_HOST,
+            state_path.clone(),
+        );
+        let env = dispatch(&args_for_gen_show(plan_id, state_path), &ctx);
+
+        assert!(env.error.is_none(), "expected success, got {env:?}");
+        let data = env.data.expect("data");
+        // History is null (this plan only ever failed, never committed).
+        assert!(data.get("history").expect("history").is_null());
+        // Failure populated with state.toml fields plus the parsed record.
+        let failure = data.get("failure").expect("failure");
+        assert!(!failure.is_null());
+        assert_eq!(
+            failure.get("class").and_then(serde_json::Value::as_u64),
+            Some(4)
+        );
+        assert_eq!(
+            failure.get("exit_code").and_then(serde_json::Value::as_u64),
+            Some(5)
+        );
+        let record = failure.get("record").expect("record field");
+        assert!(
+            !record.is_null(),
+            "record must be populated when JSON file is readable"
+        );
+        assert_eq!(
+            record
+                .get("error_message")
+                .and_then(serde_json::Value::as_str),
+            Some("service restart failed")
+        );
+    }
+
+    #[test]
+    fn gen_show_failure_record_field_is_null_when_json_missing() {
+        let dir = TempDir::new().expect("tempdir");
+        let state_path = dir.path().join("state.toml");
+        let failures_dir = dir.path().join("failures");
+        let (plan_id, record_path) = write_state_with_failure(&state_path, &failures_dir);
+        // Wipe the record JSON to simulate a partially gone failures dir.
+        std::fs::remove_file(&record_path).expect("rm record");
+
+        let ctx = ctx_with(
+            dir.path().join("forge.ncl"),
+            MINIMAL_HOST,
+            state_path.clone(),
+        );
+        let env = dispatch(&args_for_gen_show(plan_id, state_path), &ctx);
+
+        assert!(env.error.is_none(), "expected success, got {env:?}");
+        let data = env.data.expect("data");
+        let failure = data.get("failure").expect("failure");
+        assert!(
+            !failure.is_null(),
+            "FailureRef in state.toml must still surface"
+        );
+        assert!(
+            failure.get("record").expect("record field").is_null(),
+            "record must be null when the JSON file is absent"
         );
     }
 
