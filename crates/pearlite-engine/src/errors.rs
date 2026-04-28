@@ -63,6 +63,9 @@ pub enum ApplyError {
     /// `state.toml` read or write failed during the phase-9 commit.
     #[error(transparent)]
     State(#[from] pearlite_state::StateError),
+    /// Home Manager / user-env adapter failed during phase-7 dispatch.
+    #[error(transparent)]
+    Userenv(#[from] pearlite_userenv::UserenvError),
 }
 
 /// Errors emitted by [`Engine::rollback`](crate::Engine::rollback).

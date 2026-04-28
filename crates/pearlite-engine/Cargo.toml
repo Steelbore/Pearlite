@@ -19,6 +19,7 @@ test-mocks = [
     "pearlite-snapper/test-mocks",
     "pearlite-state/test-mocks",
     "pearlite-systemd/test-mocks",
+    "pearlite-userenv/test-mocks",
 ]
 
 [dependencies]
@@ -31,6 +32,7 @@ pearlite-schema = { path = "../pearlite-schema", version = "0.1" }
 pearlite-snapper = { path = "../pearlite-snapper", version = "0.1" }
 pearlite-state = { path = "../pearlite-state", version = "0.1" }
 pearlite-systemd = { path = "../pearlite-systemd", version = "0.1" }
+pearlite-userenv = { path = "../pearlite-userenv", version = "0.1" }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -47,5 +49,6 @@ pearlite-nickel = { path = "../pearlite-nickel", version = "0.1", features = ["t
 pearlite-pacman = { path = "../pearlite-pacman", version = "0.1", features = ["test-mocks"] }
 pearlite-snapper = { path = "../pearlite-snapper", version = "0.1", features = ["test-mocks"] }
 pearlite-systemd = { path = "../pearlite-systemd", version = "0.1", features = ["test-mocks"] }
+pearlite-userenv = { path = "../pearlite-userenv", version = "0.1", features = ["test-mocks"] }
 nix = { workspace = true }
 tempfile = { workspace = true }

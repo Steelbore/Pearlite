@@ -11,6 +11,7 @@ use pearlite_pacman::Pacman;
 use pearlite_snapper::Snapper;
 use pearlite_state::{State, StateError, StateStore};
 use pearlite_systemd::Systemd;
+use pearlite_userenv::HomeManagerBackend;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use time::OffsetDateTime;
@@ -38,6 +39,8 @@ pub struct RunContext {
     pub systemd: Box<dyn Systemd>,
     /// snapper adapter (`apply` and `rollback`).
     pub snapper: Box<dyn Snapper>,
+    /// Home Manager backend (`apply` phase 7).
+    pub home_manager: Box<dyn HomeManagerBackend>,
 }
 
 /// Dispatch the parsed [`Args`] against a [`RunContext`] and return
@@ -260,6 +263,7 @@ fn dispatch_apply(
         ctx.cargo.as_ref(),
         ctx.systemd.as_ref(),
         ctx.snapper.as_ref(),
+        ctx.home_manager.as_ref(),
         opts.snapper_config,
         &ctx.state_path,
         &failures_dir,
@@ -786,6 +790,11 @@ fn apply_error_payload(
                 state_path.display()
             ),
         ),
+        ApplyError::Userenv(_) => (
+            "APPLY_USERENV",
+            "home-manager --version  # verify home-manager is reachable for the target user, then retry"
+                .to_owned(),
+        ),
     };
 
     let class_label = match default_class {
@@ -914,6 +923,7 @@ mod tests {
     use pearlite_snapper::MockSnapper;
     use pearlite_state::SCHEMA_VERSION;
     use pearlite_systemd::MockSystemd;
+    use pearlite_userenv::MockHmBackend;
     use tempfile::TempDir;
 
     const MINIMAL_HOST: &str = r#"
@@ -955,6 +965,7 @@ package = "linux-cachyos"
             cargo: Box::new(MockCargo::new()),
             systemd: Box::new(MockSystemd::new()),
             snapper: Box::new(MockSnapper::new()),
+            home_manager: Box::new(MockHmBackend::new()),
         }
     }
 
@@ -1096,6 +1107,7 @@ package = "linux-cachyos"
             cargo: Box::new(MockCargo::new()),
             systemd: Box::new(MockSystemd::new()),
             snapper: Box::new(MockSnapper::new()),
+            home_manager: Box::new(MockHmBackend::new()),
         };
         let args = args_for_plan(host, state_path);
         let env = dispatch(&args, &ctx);
@@ -1355,6 +1367,7 @@ package = "linux-cachyos"
             cargo: Box::new(MockCargo::new()),
             systemd: Box::new(MockSystemd::new()),
             snapper: Box::new(MockSnapper::new()),
+            home_manager: Box::new(MockHmBackend::new()),
         }
     }
 
@@ -1448,6 +1461,7 @@ package = "linux-cachyos"
             cargo: Box::new(MockCargo::new()),
             systemd: Box::new(MockSystemd::new()),
             snapper: Box::new(MockSnapper::new()),
+            home_manager: Box::new(MockHmBackend::new()),
         };
         let args = args_for_apply(host, state_path);
         let env = dispatch(&args, &ctx);
@@ -1959,6 +1973,7 @@ package = "linux-cachyos"
             cargo: Box::new(MockCargo::new()),
             systemd: Box::new(MockSystemd::new()),
             snapper: Box::new(snapper_with_n_snapshots(50)),
+            home_manager: Box::new(MockHmBackend::new()),
         };
         let args = args_for_rollback(plan_id, state_path);
         let env = dispatch(&args, &ctx);
@@ -2049,6 +2064,7 @@ package = "linux-cachyos"
             cargo: Box::new(MockCargo::new()),
             systemd: Box::new(MockSystemd::new()),
             snapper: Box::new(FailingSnapper),
+            home_manager: Box::new(MockHmBackend::new()),
         };
         let args = args_for_rollback(plan_id, state_path);
         let env = dispatch(&args, &ctx);

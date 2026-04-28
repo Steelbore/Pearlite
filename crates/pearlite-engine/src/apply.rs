@@ -32,6 +32,7 @@ use pearlite_pacman::Pacman;
 use pearlite_snapper::{Snapper, SnapshotInfo};
 use pearlite_state::{FailureRef, HistoryEntry, SnapshotRef, StateStore};
 use pearlite_systemd::{Scope as SystemdScope, Systemd};
+use pearlite_userenv::HomeManagerBackend;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -117,7 +118,7 @@ impl Engine {
     /// underlying [`ApplyError`].
     #[allow(
         clippy::too_many_arguments,
-        reason = "apply_plan is the orchestrator entry point; passing all four \
+        reason = "apply_plan is the orchestrator entry point; passing all five \
                   trait-object adapters + plan + state path + failures dir is the \
                   natural surface, and a builder hides too much of what's load-bearing"
     )]
@@ -128,6 +129,7 @@ impl Engine {
         cargo: &dyn Cargo,
         systemd: &dyn Systemd,
         snapper: &dyn Snapper,
+        home_manager: &dyn HomeManagerBackend,
         snapper_config: &str,
         state_path: &Path,
         failures_dir: &Path,
@@ -150,10 +152,18 @@ impl Engine {
             ApplyPhase::ConfigWrites,
             ApplyPhase::ServiceState,
             ApplyPhase::ServiceRestarts,
+            ApplyPhase::UserEnv,
         ] {
             if let Some(actions) = buckets.get(&phase) {
                 for action in actions {
-                    if let Err(e) = exec_action(action, pacman, cargo, systemd, self.repo_root()) {
+                    if let Err(e) = exec_action(
+                        action,
+                        pacman,
+                        cargo,
+                        systemd,
+                        home_manager,
+                        self.repo_root(),
+                    ) {
                         failure = Some((actions_executed, (*action).clone(), e));
                         break 'phases;
                     }
@@ -358,6 +368,7 @@ fn exec_action(
     pacman: &dyn Pacman,
     cargo: &dyn Cargo,
     systemd: &dyn Systemd,
+    home_manager: &dyn HomeManagerBackend,
     repo_root: &Path,
 ) -> Result<(), ApplyError> {
     match action {
@@ -410,13 +421,18 @@ fn exec_action(
         Action::ServiceRestart { unit } => {
             systemd.restart(unit)?;
         }
-        // Both arms below intentionally no-op. `UserEnvSwitch` is
-        // the phase-7 surface that lands its dispatch in the next
-        // M3 W2 PR (no diff classifier emits it yet, so a real
-        // apply never sees one); `SnapshotCreate` is a state-history
-        // record, never orchestrated here because the pre/post
-        // snapshot bookkeeping is taken directly by `apply_plan`.
-        Action::UserEnvSwitch { .. } | Action::SnapshotCreate { .. } => {}
+        Action::UserEnvSwitch {
+            user,
+            config_path,
+            mode,
+            channel,
+        } => {
+            home_manager.switch(user, config_path, *mode, channel)?;
+        }
+        // `SnapshotCreate` actions in plans are state-history records,
+        // not orchestration steps. The pre/post snapshot bookkeeping
+        // above handles every snapshot the apply engine actually takes.
+        Action::SnapshotCreate { .. } => {}
     }
     Ok(())
 }
@@ -502,6 +518,7 @@ mod tests {
     use pearlite_snapper::MockSnapper;
     use pearlite_state::SCHEMA_VERSION;
     use pearlite_systemd::MockSystemd;
+    use pearlite_userenv::MockHmBackend;
     use std::path::PathBuf;
     use tempfile::TempDir;
     use time::OffsetDateTime;
@@ -570,6 +587,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -580,6 +598,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -610,6 +629,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -623,6 +643,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -640,6 +661,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -660,6 +682,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -673,6 +696,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -693,6 +717,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -705,6 +730,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -720,6 +746,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -738,6 +765,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -753,6 +781,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -774,6 +803,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -793,6 +823,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -808,6 +839,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -825,6 +857,105 @@ mod tests {
     }
 
     #[test]
+    fn user_env_switch_dispatches_through_home_manager() {
+        let pacman = MockPacman::new();
+        let cargo = MockCargo::new();
+        let systemd = MockSystemd::new();
+        let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let (state_path, failures_dir) = setup_state(&state_dir);
+
+        let out = engine()
+            .apply_plan(
+                &plan_with_actions(vec![
+                    Action::UserEnvSwitch {
+                        user: "alice".to_owned(),
+                        config_path: PathBuf::from("/repo/users/alice"),
+                        mode: pearlite_schema::HomeManagerMode::Standalone,
+                        channel: "release-24.11".to_owned(),
+                    },
+                    Action::UserEnvSwitch {
+                        user: "bob".to_owned(),
+                        config_path: PathBuf::from("/repo/users/bob"),
+                        mode: pearlite_schema::HomeManagerMode::Flake,
+                        channel: "default".to_owned(),
+                    },
+                ]),
+                &pacman,
+                &cargo,
+                &systemd,
+                &snapper,
+                &home_manager,
+                "root",
+                &state_path,
+                &failures_dir,
+            )
+            .expect("apply");
+
+        assert_eq!(out.actions_executed, 2);
+        let hist = home_manager.switch_history();
+        assert_eq!(hist.len(), 2);
+        // within_phase_key sorts alphabetically by user — alice runs
+        // before bob even though declaration order matched.
+        assert_eq!(hist[0].user, "alice");
+        assert_eq!(hist[0].mode, pearlite_schema::HomeManagerMode::Standalone);
+        assert_eq!(hist[1].user, "bob");
+        assert_eq!(hist[1].mode, pearlite_schema::HomeManagerMode::Flake);
+    }
+
+    #[test]
+    fn user_env_switch_failure_propagates_as_apply_error() {
+        use pearlite_userenv::{HomeManagerBackend as HmTrait, UserEnvOutcome, UserenvError};
+        struct FailingHm;
+        impl HmTrait for FailingHm {
+            fn switch(
+                &self,
+                _: &str,
+                _: &Path,
+                _: pearlite_schema::HomeManagerMode,
+                _: &str,
+            ) -> Result<UserEnvOutcome, UserenvError> {
+                Err(UserenvError::NotInPath { hint: "test" })
+            }
+        }
+
+        let pacman = MockPacman::new();
+        let cargo = MockCargo::new();
+        let systemd = MockSystemd::new();
+        let snapper = MockSnapper::new();
+        let state_dir = TempDir::new().expect("state tempdir");
+        let (state_path, failures_dir) = setup_state(&state_dir);
+
+        let err = engine()
+            .apply_plan(
+                &plan_with_actions(vec![Action::UserEnvSwitch {
+                    user: "alice".to_owned(),
+                    config_path: PathBuf::from("/repo/users/alice"),
+                    mode: pearlite_schema::HomeManagerMode::Standalone,
+                    channel: "release-24.11".to_owned(),
+                }]),
+                &pacman,
+                &cargo,
+                &systemd,
+                &snapper,
+                &FailingHm,
+                "root",
+                &state_path,
+                &failures_dir,
+            )
+            .expect_err("must fail");
+        assert!(matches!(err, ApplyError::Userenv(_)), "got {err:?}");
+
+        // FailureRef recorded with Class 3 / exit 4 (UserEnvSwitch is
+        // Recoverable per ADR-0011 + diff::coherence).
+        let read_back = StateStore::new(state_path).read().expect("read state");
+        assert_eq!(read_back.failures.len(), 1);
+        assert_eq!(read_back.failures[0].class, 3);
+        assert_eq!(read_back.failures[0].exit_code, 4);
+    }
+
+    #[test]
     fn phase_order_removals_before_installs_before_services() {
         // Mix actions across phases in declaration order; the engine
         // must execute them in PRD §8.2 phase order.
@@ -832,6 +963,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -854,6 +986,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -872,6 +1005,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -894,6 +1028,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -911,6 +1046,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -924,6 +1060,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -982,6 +1119,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
 
         engine_with_repo_root(repo.path().to_path_buf())
             .apply_plan(
@@ -998,6 +1136,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -1026,6 +1165,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
 
         let err = engine_with_repo_root(repo.path().to_path_buf())
             .apply_plan(
@@ -1043,6 +1183,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -1076,6 +1217,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
 
         let err = engine_with_repo_root(repo.path().to_path_buf())
             .apply_plan(
@@ -1092,6 +1234,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -1129,6 +1272,7 @@ mod tests {
         let pacman = MockPacman::new();
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
+        let home_manager = MockHmBackend::new();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -1139,6 +1283,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &FailingSnapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -1153,6 +1298,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
         let state_dir = TempDir::new().expect("state tempdir");
         // Don't write a base state — apply_plan must error rather than
         // silently creating one.
@@ -1166,6 +1312,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -1180,6 +1327,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -1202,6 +1350,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -1243,6 +1392,7 @@ mod tests {
         let cargo = MockCargo::new();
         let systemd = MockSystemd::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
 
         let _ = engine_with_repo_root(repo.path().to_path_buf())
             .apply_plan(
@@ -1259,6 +1409,7 @@ mod tests {
                 &cargo,
                 &systemd,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
@@ -1316,6 +1467,7 @@ mod tests {
         let pacman = MockPacman::new();
         let cargo = MockCargo::new();
         let snapper = MockSnapper::new();
+        let home_manager = MockHmBackend::new();
         let state_dir = TempDir::new().expect("state tempdir");
         let (state_path, failures_dir) = setup_state(&state_dir);
 
@@ -1328,6 +1480,7 @@ mod tests {
                 &cargo,
                 &FailingRestart,
                 &snapper,
+                &home_manager,
                 "root",
                 &state_path,
                 &failures_dir,
