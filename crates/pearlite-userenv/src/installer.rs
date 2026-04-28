@@ -42,6 +42,23 @@ pub enum InstallOutcome {
 /// future PR may add `install_force` or a probe-only
 /// `is_installed`, but only when an engine consumer needs it.
 pub trait NixInstaller: Send + Sync {
+    /// Probe whether `nix` is already on `PATH` via `nix --version`.
+    ///
+    /// Used by the apply-side preflight check (ADR-0012 decision 3):
+    /// when a plan has [`UserEnvSwitch`](pearlite_diff::Action) actions,
+    /// nix must be installed before apply proceeds — otherwise apply
+    /// halts at preflight with `NIX_NOT_INSTALLED`. The CLI maps the
+    /// false result to the typed error.
+    ///
+    /// `Ok(false)` means nix is missing (the binary isn't on PATH);
+    /// the operator should run `pearlite bootstrap`.
+    ///
+    /// # Errors
+    /// [`InstallerError::NixProbeFailed`] when `nix --version` is found
+    /// but exits non-zero. Plain "not found" returns `Ok(false)`, not
+    /// an error.
+    fn nix_installed(&self) -> Result<bool, InstallerError>;
+
     /// Install Nix via the Determinate installer if `nix` is not
     /// already on `PATH`.
     ///
@@ -107,12 +124,16 @@ impl LiveNixInstaller {
     pub fn sh(&self) -> &Path {
         &self.sh
     }
+}
 
-    /// Run `nix --version` and decide whether nix is already
-    /// installed. Three outcomes: `Ok(true)` already installed,
-    /// `Ok(false)` not installed (caller proceeds with the script),
-    /// `Err` something else broke.
-    fn nix_already_installed(&self) -> Result<bool, InstallerError> {
+impl Default for LiveNixInstaller {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NixInstaller for LiveNixInstaller {
+    fn nix_installed(&self) -> Result<bool, InstallerError> {
         match Command::new(&self.nix).arg("--version").output() {
             Ok(out) if out.status.success() => Ok(true),
             // Non-zero exit on a found binary is "the probe failed";
@@ -126,22 +147,14 @@ impl LiveNixInstaller {
             Err(e) => Err(InstallerError::Io(e)),
         }
     }
-}
 
-impl Default for LiveNixInstaller {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl NixInstaller for LiveNixInstaller {
     fn install_if_missing(
         &self,
         script_path: &Path,
         expected_sha256: &str,
         installer_args: &[&str],
     ) -> Result<InstallOutcome, InstallerError> {
-        if self.nix_already_installed()? {
+        if self.nix_installed()? {
             return Ok(InstallOutcome::Already);
         }
 

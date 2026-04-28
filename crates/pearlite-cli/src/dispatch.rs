@@ -279,6 +279,7 @@ fn dispatch_apply(
         systemd: ctx.systemd.as_ref(),
         snapper: ctx.snapper.as_ref(),
         home_manager: ctx.home_manager.as_ref(),
+        nix_installer: ctx.nix_installer.as_ref(),
         snapper_config: opts.snapper_config,
         state_path: &ctx.state_path,
         failures_dir: &failures_dir,
@@ -928,24 +929,42 @@ fn apply_error_payload(
             "home-manager --version  # verify home-manager is reachable for the target user, then retry"
                 .to_owned(),
         ),
+        ApplyError::NixProbe(_) => (
+            "APPLY_NIX_PROBE_FAILED",
+            "nix --version  # verify the nix binary is healthy on PATH".to_owned(),
+        ),
+        ApplyError::NixNotInstalled => (
+            "NIX_NOT_INSTALLED",
+            "pearlite bootstrap --installer-script <path>  # ADR-0012".to_owned(),
+        ),
     };
 
-    let class_label = match default_class {
-        2 => "plan",
-        3 => "apply-recoverable",
-        4 => "apply-incoherent",
-        _ => "apply",
+    // NIX_NOT_INSTALLED and APPLY_NIX_PROBE_FAILED are preflight
+    // errors: apply_plan returns before any system mutation, so they
+    // don't write a FailureRef and don't follow the class-3/4
+    // recoverable taxonomy. Surface as class=preflight, exit=2.
+    let (class_label, exit_code, surfaced_class) = match err {
+        ApplyError::NixNotInstalled | ApplyError::NixProbe(_) => ("preflight", 2_u8, 1_u8),
+        _ => {
+            let label = match default_class {
+                2 => "plan",
+                3 => "apply-recoverable",
+                4 => "apply-incoherent",
+                _ => "apply",
+            };
+            (label, default_exit_code, default_class)
+        }
     };
 
     ErrorPayload {
         code: code.to_owned(),
         class: class_label.to_owned(),
-        exit_code: default_exit_code,
+        exit_code,
         message: format!("{err}"),
         hint,
         details: serde_json::json!({
             "plan_id": plan_id,
-            "failure_class": default_class,
+            "failure_class": surfaced_class,
         }),
     }
 }
