@@ -13,12 +13,12 @@ runner is gated by ADR-0009 (CachyOS-fidelity CI runner choice).
 
 | Script | Mode | Purpose |
 |---|---|---|
-| `vm-01-bootstrap-and-plan.sh` | read-only | Build the binary, run `pearlite plan` against a fixture, assert envelope shape. Safe to run on a developer host. |
-| `vm-02-installs.sh` | mutating | M2 W3 — paru install via `pearlite apply`. |
-| `vm-03-removes.sh` | mutating | M2 W3 — pacman remove via `pearlite apply`. |
-| `vm-04-config-write.sh` | mutating | M2 W3 — `/etc` write via `pearlite apply`. |
-| `vm-05-rollback.sh` | mutating | M2 W3 — `pearlite rollback <plan-id>`. |
-| `vm-06-failure-record.sh` | mutating | M2 W3 — induced apply failure → forensic record. |
+| `vm-01-bootstrap-and-plan.sh` | read-only | Build the binary, run `pearlite plan` against a fixture, assert envelope shape. Safe to run on a developer host with `nickel` + `paru` installed. |
+| `vm-02-installs.sh` | mutating | Pacman install via `pearlite apply` — declares `tree`, asserts `actions_executed == 1` and `pacman -Qe tree`. |
+| `vm-03-removes.sh` | mutating | Removal flow — apply with `tree`, then re-plan with `tree` dropped, asserts a `forgotten_package` drift entry (action emission gates on `--prune`, follow-up PR). |
+| `vm-04-config-write.sh` | mutating | Config-file write — declares `/etc/pearlite-vm-test-04.conf`, applies, asserts target SHA-256 matches source. |
+| `vm-05-rollback.sh` | mutating | Apply → rollback round-trip — asserts `pacman -Qe tree` is gone after the snapper revert restores the pre-apply subvolume. |
+| `vm-06-failure-record.sh` | mutating | Induced `APPLY_SHA_MISMATCH` failure — asserts exit 4, forensic JSON at `<failures_dir>/<plan-id>.json`, and that `gen show` surfaces the SHA-256 message. |
 
 Mutating scripts refuse to run unless `PEARLITE_VM_TEST=1` is set in
 the environment — they install/remove packages, write to `/etc`, and
