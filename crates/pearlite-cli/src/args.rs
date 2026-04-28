@@ -127,6 +127,11 @@ pub enum GenCommand {
     Show {
         /// Plan UUID to display.
         plan_id: Uuid,
+        /// Directory to look up the plan JSON in. The full
+        /// per-action breakdown is embedded under `data.plan` if the
+        /// file is found. Defaults to `<state_file dir>/plans`.
+        #[arg(long)]
+        plans_dir: Option<PathBuf>,
     },
 }
 

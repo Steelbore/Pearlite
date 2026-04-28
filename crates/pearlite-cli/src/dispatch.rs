@@ -291,12 +291,17 @@ fn dispatch_gen(
                 }),
             )
         }
-        GenCommand::Show { plan_id } => {
+        GenCommand::Show { plan_id, plans_dir } => {
             match state.history.iter().find(|h| h.plan_id == *plan_id) {
-                Some(entry) => Envelope::success(
-                    metadata_at(Some(state.host.clone())),
-                    full_history_entry_view(entry),
-                ),
+                Some(entry) => {
+                    let plans_dir = plans_dir
+                        .clone()
+                        .unwrap_or_else(|| default_plans_dir(&ctx.state_path));
+                    Envelope::success(
+                        metadata_at(Some(state.host.clone())),
+                        full_history_entry_view_with_plan(entry, &plans_dir),
+                    )
+                }
                 None => Envelope::failure(
                     metadata_at(Some(state.host.clone())),
                     ErrorPayload {
@@ -353,6 +358,36 @@ fn full_history_entry_view(entry: &pearlite_state::HistoryEntry) -> serde_json::
         "git_revision": entry.git_revision,
         "git_dirty": entry.git_dirty,
     })
+}
+
+/// Same as [`full_history_entry_view`] but additionally embeds the
+/// per-action plan content under `plan` if a JSON file for the entry
+/// exists at `<plans_dir>/<plan-id>.json`.
+///
+/// Missing or unparseable plan files surface as `plan: null` rather
+/// than an error: the history entry itself is the canonical record,
+/// and the JSON file is a forensic convenience that may legitimately
+/// be absent (e.g., a disk-full apply that failed before
+/// [`persist_plan`] could succeed).
+fn full_history_entry_view_with_plan(
+    entry: &pearlite_state::HistoryEntry,
+    plans_dir: &Path,
+) -> serde_json::Value {
+    let mut view = full_history_entry_view(entry);
+    let plan = load_plan_json(plans_dir, entry.plan_id);
+    if let serde_json::Value::Object(ref mut map) = view {
+        map.insert("plan".to_owned(), plan.unwrap_or(serde_json::Value::Null));
+    }
+    view
+}
+
+/// Load `<plans_dir>/<plan-id>.json` and return its parsed content
+/// as a [`serde_json::Value`]. Returns `None` if the file is missing
+/// or unparseable.
+fn load_plan_json(plans_dir: &Path, plan_id: uuid::Uuid) -> Option<serde_json::Value> {
+    let path = plans_dir.join(format!("{}.json", plan_id.simple()));
+    let raw = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&raw).ok()
 }
 
 fn iso8601(t: OffsetDateTime) -> String {
@@ -1176,7 +1211,10 @@ package = "linux-cachyos"
             config_dir: PathBuf::from("/etc/pearlite/repo"),
             state_file,
             command: Command::Gen {
-                gen_command: GenCommand::Show { plan_id },
+                gen_command: GenCommand::Show {
+                    plan_id,
+                    plans_dir: None,
+                },
             },
         }
     }
@@ -1237,6 +1275,82 @@ package = "linux-cachyos"
                 .get("generation")
                 .and_then(serde_json::Value::as_u64),
             Some(1)
+        );
+    }
+
+    /// Run a complete `pearlite apply` against the test ctx so the
+    /// plan JSON is persisted next to a real history entry. Returns
+    /// the `plan_id` of the entry just written.
+    fn apply_and_get_plan_id(state_path: &Path, host_path: &Path) -> uuid::Uuid {
+        let ctx = ctx_with(
+            host_path.to_path_buf(),
+            MINIMAL_HOST,
+            state_path.to_path_buf(),
+        );
+        let env = dispatch(
+            &args_for_apply(host_path.to_path_buf(), state_path.to_path_buf()),
+            &ctx,
+        );
+        assert!(env.error.is_none(), "apply failed: {env:?}");
+        let data = env.data.expect("data");
+        data.get("plan_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("plan_id")
+            .parse()
+            .expect("uuid parse")
+    }
+
+    #[test]
+    fn gen_show_embeds_plan_content_when_file_exists() {
+        let dir = TempDir::new().expect("tempdir");
+        let host = dir.path().join("forge.ncl");
+        let state_path = dir.path().join("state.toml");
+        write_baseline_state(&state_path);
+        let plan_id = apply_and_get_plan_id(&state_path, &host);
+
+        let ctx = ctx_with(host, MINIMAL_HOST, state_path.clone());
+        let env = dispatch(&args_for_gen_show(plan_id, state_path), &ctx);
+
+        assert!(env.error.is_none(), "expected success, got {env:?}");
+        let data = env.data.expect("data");
+        let plan = data.get("plan").expect("plan field");
+        assert!(
+            !plan.is_null(),
+            "plan field must be populated when the JSON exists"
+        );
+        // Sanity-check it's a real Plan: has a plan_id matching the
+        // history entry, and an actions array.
+        assert_eq!(
+            plan.get("plan_id").and_then(serde_json::Value::as_str),
+            Some(plan_id.to_string()).as_deref()
+        );
+        assert!(
+            plan.get("actions").is_some(),
+            "embedded plan must carry actions"
+        );
+    }
+
+    #[test]
+    fn gen_show_plan_field_is_null_when_file_missing() {
+        let dir = TempDir::new().expect("tempdir");
+        let state_path = dir.path().join("state.toml");
+        // History entry exists, but no <plans_dir>/<plan-id>.json was
+        // written (this is the disk-full / pre-PR-#36 state).
+        let plan_id = write_state_with_history(&state_path, 5);
+
+        let ctx = ctx_with(
+            dir.path().join("forge.ncl"),
+            MINIMAL_HOST,
+            state_path.clone(),
+        );
+        let env = dispatch(&args_for_gen_show(plan_id, state_path), &ctx);
+
+        assert!(env.error.is_none(), "expected success, got {env:?}");
+        let data = env.data.expect("data");
+        let plan = data.get("plan").expect("plan field");
+        assert!(
+            plan.is_null(),
+            "plan must be null when the JSON file is absent, got {plan:?}"
         );
     }
 
