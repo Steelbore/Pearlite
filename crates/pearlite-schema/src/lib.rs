@@ -14,6 +14,7 @@ mod config;
 mod declared;
 mod errors;
 mod host;
+mod nix;
 mod packages;
 mod parse;
 mod probed;
@@ -26,6 +27,7 @@ pub use config::{ConfigEntry, RemovePolicy};
 pub use declared::DeclaredState;
 pub use errors::{ContractViolation, SchemaError};
 pub use host::{ArchLevel, HostMeta, KernelDecl};
+pub use nix::{NixDecl, NixInstallerDecl};
 pub use packages::PackageSet;
 pub use parse::from_resolved_toml;
 pub use probed::{

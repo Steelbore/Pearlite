@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigEntry, RemovePolicy};
 use crate::host::{HostMeta, KernelDecl};
+use crate::nix::NixDecl;
 use crate::packages::PackageSet;
 use crate::services::ServicesDecl;
 use crate::snapshots::SnapshotPolicy;
@@ -44,4 +45,9 @@ pub struct DeclaredState {
     /// Snapshot retention policy.
     #[serde(default)]
     pub snapshots: SnapshotPolicy,
+    /// Optional nix bootstrap declaration. Required by the schema
+    /// validator iff any user has `home_manager.enabled = true` —
+    /// see [`ContractViolation::NIX_INSTALLER_REQUIRED`](crate::ContractViolation).
+    #[serde(default)]
+    pub nix: Option<NixDecl>,
 }

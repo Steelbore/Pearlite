@@ -22,6 +22,9 @@ use std::collections::BTreeMap;
 ///   disjoint.
 /// - **`ARCH_LEVEL_MISMATCH`** — `meta.arch_level = "v3"` forbids a
 ///   non-empty `packages.cachyos-v4`, and symmetrically.
+/// - **`NIX_INSTALLER_REQUIRED`** — any user with
+///   `home_manager.enabled = true` requires a present, well-formed
+///   `nix.installer.expected_sha256` (64 lowercase hex chars).
 ///
 /// # Errors
 /// Returns every violation found, not just the first.
@@ -30,6 +33,7 @@ pub fn validate(d: &DeclaredState) -> Result<(), Vec<ContractViolation>> {
     check_duplicate_packages(d, &mut violations);
     check_kernel_modules_unique(d, &mut violations);
     check_arch_level_matches_packages(d, &mut violations);
+    check_nix_installer_required(d, &mut violations);
     if violations.is_empty() {
         Ok(())
     } else {
@@ -109,6 +113,42 @@ fn check_arch_level_matches_packages(d: &DeclaredState, violations: &mut Vec<Con
             });
         }
         _ => {}
+    }
+}
+
+fn check_nix_installer_required(d: &DeclaredState, violations: &mut Vec<ContractViolation>) {
+    let any_hm_enabled = d
+        .users
+        .iter()
+        .any(|u| u.home_manager.as_ref().is_some_and(|hm| hm.enabled));
+    if !any_hm_enabled {
+        return;
+    }
+    match d.nix.as_ref() {
+        None => {
+            violations.push(ContractViolation {
+                id: ContractViolation::NIX_INSTALLER_REQUIRED,
+                message:
+                    "at least one user has home_manager.enabled = true but [nix.installer] is not declared"
+                        .to_owned(),
+            });
+        }
+        Some(nix) => {
+            let sha = &nix.installer.expected_sha256;
+            if sha.len() != 64
+                || !sha
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                violations.push(ContractViolation {
+                    id: ContractViolation::NIX_INSTALLER_REQUIRED,
+                    message: format!(
+                        "nix.installer.expected_sha256 must be 64 lowercase hex chars, got {} chars",
+                        sha.len()
+                    ),
+                });
+            }
+        }
     }
 }
 
@@ -211,6 +251,66 @@ mod tests {
         let err = validate(&d).expect_err("arch-level mismatch must be flagged");
         assert_eq!(err.len(), 1);
         assert_eq!(err[0].id, ContractViolation::ARCH_LEVEL_MISMATCH);
+    }
+
+    #[test]
+    fn validate_nix_installer_required_when_hm_enabled_but_block_missing() {
+        let mut d = from_resolved_toml(FULL).expect("parse");
+        d.nix = None;
+
+        let err = validate(&d).expect_err("missing [nix.installer] must be flagged");
+        assert!(
+            err.iter()
+                .any(|v| v.id == ContractViolation::NIX_INSTALLER_REQUIRED
+                    && v.message.contains("home_manager.enabled = true"))
+        );
+    }
+
+    #[test]
+    fn validate_nix_installer_sha_must_be_64_lowercase_hex() {
+        let mut d = from_resolved_toml(FULL).expect("parse");
+        d.nix = Some(crate::NixDecl {
+            installer: crate::NixInstallerDecl {
+                expected_sha256: "not-hex".to_owned(),
+            },
+        });
+
+        let err = validate(&d).expect_err("malformed sha must be flagged");
+        assert!(
+            err.iter()
+                .any(|v| v.id == ContractViolation::NIX_INSTALLER_REQUIRED
+                    && v.message.contains("64 lowercase hex chars"))
+        );
+    }
+
+    #[test]
+    fn validate_nix_installer_rejects_uppercase_hex() {
+        let mut d = from_resolved_toml(FULL).expect("parse");
+        let upper = "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef";
+        d.nix = Some(crate::NixDecl {
+            installer: crate::NixInstallerDecl {
+                expected_sha256: upper.to_owned(),
+            },
+        });
+
+        let err = validate(&d).expect_err("uppercase hex must be flagged");
+        assert!(
+            err.iter()
+                .any(|v| v.id == ContractViolation::NIX_INSTALLER_REQUIRED)
+        );
+    }
+
+    #[test]
+    fn validate_no_nix_block_required_when_hm_disabled_everywhere() {
+        let mut d = from_resolved_toml(FULL).expect("parse");
+        for user in &mut d.users {
+            if let Some(hm) = user.home_manager.as_mut() {
+                hm.enabled = false;
+            }
+        }
+        d.nix = None;
+
+        validate(&d).expect("HM disabled everywhere → nix block optional");
     }
 
     #[test]
