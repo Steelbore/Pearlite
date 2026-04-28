@@ -91,6 +91,34 @@ pub enum RollbackError {
     },
 }
 
+/// Errors emitted by [`Engine::bootstrap`](crate::Engine::bootstrap)
+/// (ADR-0012).
+#[derive(Debug, Error)]
+pub enum BootstrapError {
+    /// Nickel evaluator failed loading the host file.
+    #[error(transparent)]
+    Nickel(#[from] pearlite_nickel::NickelError),
+    /// The declared host has no `[nix.installer]` block; bootstrap
+    /// makes no sense for hosts that don't need nix. Hint: declare
+    /// `nix.installer.expected_sha256` or skip this command.
+    #[error(
+        "host file has no [nix.installer] block; declare nix.installer.expected_sha256 to bootstrap"
+    )]
+    NixNotDeclared,
+    /// Determinate Nix installer adapter failed (SHA mismatch,
+    /// non-zero script exit, missing shell, etc.).
+    #[error(transparent)]
+    Installer(#[from] pearlite_userenv::InstallerError),
+    /// Filesystem operation (atomic write of `/etc/nix/nix.conf`)
+    /// failed.
+    #[error(transparent)]
+    Fs(#[from] pearlite_fs::FsError),
+    /// Reading existing `/etc/nix/nix.conf` failed for a reason other
+    /// than "not found".
+    #[error("failed to read /etc/nix/nix.conf: {0}")]
+    Io(#[source] std::io::Error),
+}
+
 /// Errors emitted by [`Engine::plan`](crate::Engine::plan) and friends.
 #[derive(Debug, Error)]
 pub enum EngineError {

@@ -8,13 +8,15 @@
 //! Apply, rollback, and reconcile arrive in M2+ per Plan §7.
 
 mod apply;
+mod bootstrap;
 mod errors;
 mod plan;
 mod probe;
 mod rollback;
 
 pub use apply::{ApplyContext, ApplyOutcome, FailureRecord};
-pub use errors::{ApplyError, EngineError, ProbeError, RollbackError};
+pub use bootstrap::BootstrapOutcome;
+pub use errors::{ApplyError, BootstrapError, EngineError, ProbeError, RollbackError};
 pub use plan::Engine;
 pub use probe::{LiveProbe, SystemProbe};
 pub use rollback::RollbackOutcome;

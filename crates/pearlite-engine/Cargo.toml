@@ -33,6 +33,7 @@ pearlite-snapper = { path = "../pearlite-snapper", version = "0.1" }
 pearlite-state = { path = "../pearlite-state", version = "0.1" }
 pearlite-systemd = { path = "../pearlite-systemd", version = "0.1" }
 pearlite-userenv = { path = "../pearlite-userenv", version = "0.1" }
+nix = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

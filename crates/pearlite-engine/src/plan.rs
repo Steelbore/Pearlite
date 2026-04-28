@@ -55,6 +55,13 @@ impl Engine {
         &self.repo_root
     }
 
+    /// Borrow the Nickel evaluator. Crate-internal so other engine
+    /// modules (`bootstrap`) can re-use the same adapter without
+    /// pushing it through the call surface.
+    pub(crate) fn nickel(&self) -> &dyn NickelEvaluator {
+        &*self.nickel
+    }
+
     /// Compute a [`Plan`] without changing any system state.
     ///
     /// Steps:
