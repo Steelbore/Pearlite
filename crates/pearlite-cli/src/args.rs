@@ -133,6 +133,35 @@ pub enum Command {
         #[arg(long)]
         bare: bool,
     },
+    /// Bootstrap nix on a fresh host (ADR-0012).
+    ///
+    /// One-shot side-effect: verifies the operator-supplied installer
+    /// script against the SHA-256 declared in the host's
+    /// `nix.installer.expected_sha256`, runs the Determinate Nix
+    /// installer if `nix --version` fails, and writes
+    /// `/etc/nix/nix.conf` with `experimental-features = nix-command
+    /// flakes` (idempotent — operator preamble is preserved).
+    ///
+    /// Bootstrap is **not** rolled back by `pearlite rollback`: nix
+    /// touches `/nix` (its own subvolume on btrfs) which lives outside
+    /// the Snapper-managed root. Recovery uses Determinate's own
+    /// uninstall path.
+    Bootstrap {
+        /// Host file to evaluate. Defaults to
+        /// `<config_dir>/hosts/<hostname>.ncl`.
+        #[arg(long)]
+        host_file: Option<PathBuf>,
+        /// Path to the already-downloaded Determinate Nix installer
+        /// script. The SHA-256 of this file's bytes is checked against
+        /// the host's `nix.installer.expected_sha256`; the script is
+        /// **never** executed if the hash mismatches (ADR-004).
+        #[arg(long)]
+        installer_script: PathBuf,
+        /// Path to the system-wide nix.conf. Defaults to
+        /// `/etc/nix/nix.conf`. Override only for tests.
+        #[arg(long, default_value = "/etc/nix/nix.conf")]
+        nix_conf: PathBuf,
+    },
 }
 
 /// Sub-actions for [`Command::Gen`].

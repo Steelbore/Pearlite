@@ -11,7 +11,7 @@ use pearlite_pacman::Pacman;
 use pearlite_snapper::Snapper;
 use pearlite_state::{State, StateError, StateStore};
 use pearlite_systemd::Systemd;
-use pearlite_userenv::HomeManagerBackend;
+use pearlite_userenv::{HomeManagerBackend, NixInstaller};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use time::OffsetDateTime;
@@ -41,6 +41,10 @@ pub struct RunContext {
     pub snapper: Box<dyn Snapper>,
     /// Home Manager backend (`apply` phase 7).
     pub home_manager: Box<dyn HomeManagerBackend>,
+    /// Determinate Nix installer adapter (`bootstrap` only). Per
+    /// ADR-0012 / ADR-004: the only curl-piped script Pearlite
+    /// tolerates, defended by a hash-pin from the host config.
+    pub nix_installer: Box<dyn NixInstaller>,
 }
 
 /// Dispatch the parsed [`Args`] against a [`RunContext`] and return
@@ -122,6 +126,18 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
             snapper_config,
         } => dispatch_rollback(ctx, *plan_id, snapper_config, &metadata_at),
         Command::Gen { gen_command } => dispatch_gen(ctx, gen_command, &metadata_at),
+        Command::Bootstrap {
+            host_file,
+            installer_script,
+            nix_conf,
+        } => dispatch_bootstrap(
+            args,
+            ctx,
+            host_file.as_ref(),
+            installer_script,
+            nix_conf,
+            &metadata_at,
+        ),
         Command::Schema { bare } => {
             if *bare {
                 Envelope::success(metadata_at(None), bare_schema())
@@ -273,6 +289,122 @@ fn dispatch_apply(
             metadata_at(Some(host)),
             apply_error_payload(&e, &ctx.state_path, plan_id),
         ),
+    }
+}
+
+/// Dispatch arm for `pearlite bootstrap` (ADR-0012).
+///
+/// Wires `Engine::bootstrap` with the operator-supplied installer
+/// script. The host file's `nix.installer.expected_sha256` defends
+/// the script (ADR-004). Bootstrap state is not recorded in
+/// `state.toml` — see ADR-0012 decision 4.
+fn dispatch_bootstrap(
+    args: &Args,
+    ctx: &RunContext,
+    host_file: Option<&PathBuf>,
+    installer_script: &Path,
+    nix_conf: &Path,
+    metadata_at: &dyn Fn(Option<String>) -> Metadata,
+) -> Envelope {
+    let host_path = host_file
+        .cloned()
+        .unwrap_or_else(|| default_host_file(&args.config_dir, &ctx.fallback_host));
+    match ctx.engine.bootstrap(
+        &host_path,
+        ctx.nix_installer.as_ref(),
+        installer_script,
+        nix_conf,
+    ) {
+        Ok(outcome) => Envelope::success(
+            metadata_at(Some(ctx.fallback_host.clone())),
+            bootstrap_outcome_view(outcome),
+        ),
+        Err(e) => Envelope::failure(
+            metadata_at(Some(ctx.fallback_host.clone())),
+            bootstrap_error_payload(&e),
+        ),
+    }
+}
+
+/// Render-friendly view of [`pearlite_engine::BootstrapOutcome`].
+fn bootstrap_outcome_view(outcome: pearlite_engine::BootstrapOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "install": match outcome.install {
+            pearlite_userenv::InstallOutcome::Already => "already",
+            pearlite_userenv::InstallOutcome::Installed => "installed",
+        },
+        "nix_conf_written": outcome.nix_conf_written,
+    })
+}
+
+/// Map `BootstrapError` to a typed [`ErrorPayload`].
+///
+/// All bootstrap failures land in PRD §8.5 class 2 (preflight) —
+/// nothing on the system has been irreversibly mutated by the time
+/// these surface. Exit code 2 throughout.
+fn bootstrap_error_payload(err: &pearlite_engine::BootstrapError) -> ErrorPayload {
+    use pearlite_engine::BootstrapError as B;
+    use pearlite_userenv::InstallerError as I;
+    match err {
+        B::Nickel(e) => ErrorPayload {
+            code: "BOOTSTRAP_NICKEL_FAILED".to_owned(),
+            class: "preflight".to_owned(),
+            exit_code: 2,
+            message: format!("could not load host file: {e}"),
+            hint: "verify the host file path; run `pearlite plan` first to surface schema issues"
+                .to_owned(),
+            details: serde_json::Value::Null,
+        },
+        B::NixNotDeclared => ErrorPayload {
+            code: "NIX_NOT_DECLARED".to_owned(),
+            class: "preflight".to_owned(),
+            exit_code: 2,
+            message: "host file has no [nix.installer] block".to_owned(),
+            hint: "declare nix.installer.expected_sha256 in your host file, or skip \
+                   `pearlite bootstrap` for hosts that don't need nix"
+                .to_owned(),
+            details: serde_json::Value::Null,
+        },
+        B::Installer(I::Sha256Mismatch { expected, actual }) => ErrorPayload {
+            code: "NIX_INSTALLER_SHA256_MISMATCH".to_owned(),
+            class: "preflight".to_owned(),
+            exit_code: 2,
+            message: format!(
+                "installer script SHA-256 mismatch: declared {expected}, got {actual}"
+            ),
+            hint: "update the host's nix.installer.expected_sha256 to match the script you're \
+                   bootstrapping against, or fetch the matching installer version"
+                .to_owned(),
+            details: serde_json::json!({
+                "expected_sha256": expected,
+                "actual_sha256": actual,
+            }),
+        },
+        B::Installer(other) => ErrorPayload {
+            code: "NIX_INSTALLER_FAILED".to_owned(),
+            class: "preflight".to_owned(),
+            exit_code: 2,
+            message: format!("Determinate Nix installer failed: {other}"),
+            hint: "inspect the installer's stderr above; re-run after addressing the cause"
+                .to_owned(),
+            details: serde_json::Value::Null,
+        },
+        B::Fs(e) => ErrorPayload {
+            code: "BOOTSTRAP_NIX_CONF_WRITE_FAILED".to_owned(),
+            class: "preflight".to_owned(),
+            exit_code: 2,
+            message: format!("writing /etc/nix/nix.conf failed: {e}"),
+            hint: "ensure pearlite is invoked as root for the nix.conf write".to_owned(),
+            details: serde_json::Value::Null,
+        },
+        B::Io(e) => ErrorPayload {
+            code: "BOOTSTRAP_NIX_CONF_READ_FAILED".to_owned(),
+            class: "preflight".to_owned(),
+            exit_code: 2,
+            message: format!("reading existing /etc/nix/nix.conf failed: {e}"),
+            hint: "check the file's permissions; re-run as root if needed".to_owned(),
+            details: serde_json::Value::Null,
+        },
     }
 }
 
@@ -559,6 +691,7 @@ fn label_for(command: &Command) -> String {
             GenCommand::Show { .. } => "pearlite gen show".to_owned(),
         },
         Command::Schema { .. } => "pearlite schema".to_owned(),
+        Command::Bootstrap { .. } => "pearlite bootstrap".to_owned(),
     }
 }
 
@@ -923,7 +1056,7 @@ mod tests {
     use pearlite_snapper::MockSnapper;
     use pearlite_state::SCHEMA_VERSION;
     use pearlite_systemd::MockSystemd;
-    use pearlite_userenv::MockHmBackend;
+    use pearlite_userenv::{MockHmBackend, MockNixInstaller};
     use tempfile::TempDir;
 
     const MINIMAL_HOST: &str = r#"
@@ -966,6 +1099,7 @@ package = "linux-cachyos"
             systemd: Box::new(MockSystemd::new()),
             snapper: Box::new(MockSnapper::new()),
             home_manager: Box::new(MockHmBackend::new()),
+            nix_installer: Box::new(MockNixInstaller::new()),
         }
     }
 
@@ -1108,6 +1242,7 @@ package = "linux-cachyos"
             systemd: Box::new(MockSystemd::new()),
             snapper: Box::new(MockSnapper::new()),
             home_manager: Box::new(MockHmBackend::new()),
+            nix_installer: Box::new(MockNixInstaller::new()),
         };
         let args = args_for_plan(host, state_path);
         let env = dispatch(&args, &ctx);
@@ -1368,6 +1503,7 @@ package = "linux-cachyos"
             systemd: Box::new(MockSystemd::new()),
             snapper: Box::new(MockSnapper::new()),
             home_manager: Box::new(MockHmBackend::new()),
+            nix_installer: Box::new(MockNixInstaller::new()),
         }
     }
 
@@ -1462,6 +1598,7 @@ package = "linux-cachyos"
             systemd: Box::new(MockSystemd::new()),
             snapper: Box::new(MockSnapper::new()),
             home_manager: Box::new(MockHmBackend::new()),
+            nix_installer: Box::new(MockNixInstaller::new()),
         };
         let args = args_for_apply(host, state_path);
         let env = dispatch(&args, &ctx);
@@ -1974,6 +2111,7 @@ package = "linux-cachyos"
             systemd: Box::new(MockSystemd::new()),
             snapper: Box::new(snapper_with_n_snapshots(50)),
             home_manager: Box::new(MockHmBackend::new()),
+            nix_installer: Box::new(MockNixInstaller::new()),
         };
         let args = args_for_rollback(plan_id, state_path);
         let env = dispatch(&args, &ctx);
@@ -2065,6 +2203,7 @@ package = "linux-cachyos"
             systemd: Box::new(MockSystemd::new()),
             snapper: Box::new(FailingSnapper),
             home_manager: Box::new(MockHmBackend::new()),
+            nix_installer: Box::new(MockNixInstaller::new()),
         };
         let args = args_for_rollback(plan_id, state_path);
         let env = dispatch(&args, &ctx);
@@ -2073,6 +2212,84 @@ package = "linux-cachyos"
         assert_eq!(err.code, "ROLLBACK_SNAPPER");
         assert_eq!(err.exit_code, 4);
         assert_eq!(err.class, "apply-recoverable");
+    }
+
+    const HOST_WITH_NIX: &str = r#"
+[meta]
+hostname = "forge"
+timezone = "UTC"
+arch_level = "v4"
+locale = "en_US.UTF-8"
+keymap = "us"
+
+[kernel]
+package = "linux-cachyos"
+
+[nix.installer]
+expected_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+"#;
+
+    fn args_for_bootstrap(
+        host_file: PathBuf,
+        state_file: PathBuf,
+        installer_script: PathBuf,
+        nix_conf: PathBuf,
+    ) -> Args {
+        Args {
+            format: OutputFormat::Json,
+            config_dir: PathBuf::from("/etc/pearlite/repo"),
+            state_file,
+            command: Command::Bootstrap {
+                host_file: Some(host_file),
+                installer_script,
+                nix_conf,
+            },
+        }
+    }
+
+    #[test]
+    fn bootstrap_dispatches_through_engine_and_renders_outcome() {
+        let dir = TempDir::new().expect("tempdir");
+        let host = dir.path().join("forge.ncl");
+        let state_path = dir.path().join("state.toml");
+        let nix_conf = dir.path().join("nix.conf");
+        let script = dir.path().join("installer.sh");
+        std::fs::write(&script, b"#!/bin/sh\nexit 0\n").expect("write script");
+
+        let ctx = ctx_with(host.clone(), HOST_WITH_NIX, state_path.clone());
+        let args = args_for_bootstrap(host, state_path, script, nix_conf);
+        let env = dispatch(&args, &ctx);
+
+        assert!(env.error.is_none(), "got error {:?}", env.error);
+        let data = env.data.expect("data populated");
+        assert_eq!(
+            data.get("install").and_then(serde_json::Value::as_str),
+            Some("installed")
+        );
+        assert_eq!(
+            data.get("nix_conf_written")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn bootstrap_surfaces_nix_not_declared_when_block_missing() {
+        let dir = TempDir::new().expect("tempdir");
+        let host = dir.path().join("forge.ncl");
+        let state_path = dir.path().join("state.toml");
+        let nix_conf = dir.path().join("nix.conf");
+        let script = dir.path().join("installer.sh");
+        std::fs::write(&script, b"#!/bin/sh\nexit 0\n").expect("write script");
+
+        let ctx = ctx_with(host.clone(), MINIMAL_HOST, state_path.clone());
+        let args = args_for_bootstrap(host, state_path, script, nix_conf);
+        let env = dispatch(&args, &ctx);
+
+        let err = env.error.expect("must error");
+        assert_eq!(err.code, "NIX_NOT_DECLARED");
+        assert_eq!(err.class, "preflight");
+        assert_eq!(err.exit_code, 2);
     }
 
     #[test]

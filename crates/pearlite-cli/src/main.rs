@@ -11,7 +11,7 @@ use pearlite_nickel::LiveNickel;
 use pearlite_pacman::LivePacman;
 use pearlite_snapper::LiveSnapper;
 use pearlite_systemd::LiveSystemd;
-use pearlite_userenv::LiveHmBackend;
+use pearlite_userenv::{LiveHmBackend, LiveNixInstaller};
 use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         systemd: Box::new(LiveSystemd::new()),
         snapper: Box::new(LiveSnapper::new()),
         home_manager: Box::new(LiveHmBackend::new()),
+        nix_installer: Box::new(LiveNixInstaller::new()),
     };
 
     let envelope = dispatch(&args, &ctx);
