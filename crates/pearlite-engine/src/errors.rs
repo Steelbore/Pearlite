@@ -65,6 +65,29 @@ pub enum ApplyError {
     State(#[from] pearlite_state::StateError),
 }
 
+/// Errors emitted by [`Engine::rollback`](crate::Engine::rollback).
+///
+/// Rollback is the user-driven counterpart to apply: the operator
+/// invokes it explicitly after a Class 3/4 failure (PRD §8.5,
+/// CLAUDE.md hard invariant 9). Each variant identifies whether the
+/// failure was on the bookkeeping side (state read, plan lookup) or
+/// the system side (snapper revert).
+#[derive(Debug, Error)]
+pub enum RollbackError {
+    /// `state.toml` could not be read.
+    #[error(transparent)]
+    State(#[from] pearlite_state::StateError),
+    /// Snapper adapter failed.
+    #[error(transparent)]
+    Snapper(#[from] pearlite_snapper::SnapperError),
+    /// No `[[history]]` entry matches the requested plan ID.
+    #[error("no apply with plan_id {plan_id} found in state.toml history")]
+    PlanNotFound {
+        /// Plan UUID the caller asked to roll back to.
+        plan_id: uuid::Uuid,
+    },
+}
+
 /// Errors emitted by [`Engine::plan`](crate::Engine::plan) and friends.
 #[derive(Debug, Error)]
 pub enum EngineError {
