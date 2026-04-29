@@ -9,12 +9,22 @@
 //!
 //! ## Scope (this chunk)
 //!
-//! `meta`, `kernel`, and `packages` are emitted. Unprobed `meta`
-//! fields (`timezone`, `arch_level`, `locale`, `keymap`) emit
+//! `meta`, `kernel`, `packages`, and `services` are emitted. Unprobed
+//! `meta` fields (`timezone`, `arch_level`, `locale`, `keymap`) emit
 //! conservative defaults that the operator hand-edits after reconcile
 //! lands the file at `<config_dir>/hosts/<host>.imported.ncl`.
-//! Subsequent chunks add the `services`, `users`, and config-file
-//! blocks.
+//! Subsequent chunks add the `users` and config-file blocks.
+//!
+//! ## Services-block caveat
+//!
+//! On a typical CachyOS install, `systemctl list-unit-files` reports
+//! hundreds of enabled units (every package-installed default), so
+//! emitting `services.enabled` verbatim produces a noisy starting
+//! point. Per PRD §11 the imported file is a *review draft*, not a
+//! polished declaration; operators are expected to curate. We emit
+//! the full sorted/deduped set rather than try to guess "noise"
+//! versus "intentional" — guessing wrong silently drops state that
+//! ought to be declared.
 //!
 //! The `packages` block buckets explicit packages by their probed
 //! repo: `core`/`extra`/`multilib`/unknown → `packages.core`,
@@ -35,7 +45,7 @@
 //!   output is operator-readable, not pretty-printed by `nickel
 //!   format`. Operators run that themselves if desired.
 
-use pearlite_schema::{CargoInventory, PacmanInventory, ProbedState};
+use pearlite_schema::{CargoInventory, PacmanInventory, ProbedState, ServiceInventory};
 use std::collections::BTreeMap;
 
 /// Render a Nickel host-config string from `probed`.
@@ -64,6 +74,7 @@ pub fn emit_host(probed: &ProbedState) -> String {
     push_meta(&mut out, &probed.host.hostname);
     push_kernel(&mut out, &probed.kernel.package);
     push_packages(&mut out, probed.pacman.as_ref(), probed.cargo.as_ref());
+    push_services(&mut out, probed.services.as_ref());
     out.push_str("}\n");
     out
 }
@@ -139,6 +150,28 @@ fn bucket_packages(
     buckets
 }
 
+fn push_services(out: &mut String, services: Option<&ServiceInventory>) {
+    out.push_str("  services = {\n");
+    if let Some(s) = services {
+        push_service_array(out, "enabled", &s.enabled);
+        push_service_array(out, "disabled", &s.disabled);
+        push_service_array(out, "masked", &s.masked);
+    } else {
+        // Probe didn't return a service inventory — emit empty
+        // declarations so the schema's #[serde(default)] doesn't have
+        // to absorb a missing block.
+        push_array_field(out, "enabled", &[]);
+        push_array_field(out, "disabled", &[]);
+        push_array_field(out, "masked", &[]);
+    }
+    out.push_str("  },\n");
+}
+
+fn push_service_array(out: &mut String, key: &str, units: &std::collections::BTreeSet<String>) {
+    let v: Vec<String> = units.iter().cloned().collect();
+    push_array_field(out, key, &v);
+}
+
 fn bucket_for_repo(repo: Option<&str>) -> &'static str {
     match repo {
         Some("cachyos") => "cachyos",
@@ -207,7 +240,7 @@ fn escape(s: &str) -> String {
 )]
 mod tests {
     use super::*;
-    use pearlite_schema::{HostInfo, KernelInfo};
+    use pearlite_schema::{HostInfo, KernelInfo, ServiceInventory};
     use std::collections::{BTreeMap, BTreeSet};
     use time::OffsetDateTime;
 
@@ -361,6 +394,55 @@ mod tests {
         );
         let out = emit_host(&probed);
         assert!(out.contains(r#"core = ["chaotic-pkg"],"#));
+    }
+
+    fn make_services(enabled: &[&str], disabled: &[&str], masked: &[&str]) -> ServiceInventory {
+        let to_set =
+            |xs: &[&str]| -> BTreeSet<String> { xs.iter().map(|x| (*x).to_owned()).collect() };
+        ServiceInventory {
+            enabled: to_set(enabled),
+            disabled: to_set(disabled),
+            masked: to_set(masked),
+            active: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn emit_services_emits_three_arrays() {
+        let mut probed = probed_with("forge", "linux-cachyos");
+        probed.services = Some(make_services(
+            &["sshd.service", "NetworkManager.service"],
+            &["bluetooth.service"],
+            &["systemd-resolved.service"],
+        ));
+        let out = emit_host(&probed);
+        // BTreeSet enumerates in sorted order: NetworkManager <
+        // sshd lexicographically.
+        assert!(out.contains(r#"enabled = ["NetworkManager.service", "sshd.service"],"#));
+        assert!(out.contains(r#"disabled = ["bluetooth.service"],"#));
+        assert!(out.contains(r#"masked = ["systemd-resolved.service"],"#));
+    }
+
+    #[test]
+    fn emit_services_emits_empty_block_when_inventory_absent() {
+        let probed = probed_with("forge", "linux-cachyos");
+        let out = emit_host(&probed);
+        assert!(out.contains("services = {"));
+        assert!(out.contains("enabled = [],"));
+        assert!(out.contains("disabled = [],"));
+        assert!(out.contains("masked = [],"));
+    }
+
+    #[test]
+    fn emit_services_appears_after_packages() {
+        let probed = probed_with("forge", "linux-cachyos");
+        let out = emit_host(&probed);
+        let packages_at = out.find("packages = ").expect("packages block");
+        let services_at = out.find("services = ").expect("services block");
+        assert!(
+            packages_at < services_at,
+            "packages must precede services for stable golden-fixture diffs"
+        );
     }
 
     #[test]
