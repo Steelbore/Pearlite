@@ -127,6 +127,51 @@ pub enum BootstrapError {
     Io(#[source] std::io::Error),
 }
 
+/// Errors emitted by [`Engine::reconcile`](crate::Engine::reconcile)
+/// (PRD §11, M4 W1).
+///
+/// `reconcile` is read-only: it probes the live system and writes a
+/// fresh `<config_dir>/hosts/<hostname>.imported.ncl` for the operator
+/// to review. Variants identify whether the failure was on the probe
+/// side, validation of the probed hostname, or the filesystem write.
+#[derive(Debug, Error)]
+pub enum ReconcileError {
+    /// Probing the live system failed.
+    #[error(transparent)]
+    Probe(#[from] ProbeError),
+    /// Probe returned an empty hostname; reconcile refuses rather than
+    /// landing the import at `<config_dir>/hosts/.imported.ncl`.
+    #[error(
+        "probe returned an empty hostname; set /etc/hostname before running `pearlite reconcile`"
+    )]
+    EmptyHostname,
+    /// Probed hostname contains characters disallowed in a filename
+    /// (path separators, NUL). RFC 1123 hostnames are already
+    /// constrained, so this only fires on malformed system state.
+    #[error("probed hostname {hostname:?} is not a valid filename component")]
+    InvalidHostname {
+        /// The offending hostname value as probed.
+        hostname: String,
+    },
+    /// Target `.imported.ncl` already exists. Reconcile refuses to
+    /// clobber operator review state; the operator removes or renames
+    /// the existing file and retries.
+    #[error("{path} already exists; remove or rename it before re-running reconcile")]
+    AlreadyExists {
+        /// Path that would have been written.
+        path: std::path::PathBuf,
+    },
+    /// Filesystem operation (mkdir, atomic write) failed.
+    #[error("I/O error at {path}: {source}")]
+    Io {
+        /// Path involved in the failed operation.
+        path: std::path::PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 /// Errors emitted by [`Engine::plan`](crate::Engine::plan) and friends.
 #[derive(Debug, Error)]
 pub enum EngineError {

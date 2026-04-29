@@ -62,6 +62,12 @@ impl Engine {
         &*self.nickel
     }
 
+    /// Borrow the system probe. Crate-internal so `reconcile`
+    /// re-uses the same adapter without an extra trait surface.
+    pub(crate) fn probe(&self) -> &dyn SystemProbe {
+        &*self.probe
+    }
+
     /// Compute a [`Plan`] without changing any system state.
     ///
     /// Steps:
