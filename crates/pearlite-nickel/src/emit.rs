@@ -9,12 +9,26 @@
 //!
 //! ## Scope (this chunk)
 //!
-//! `meta`, `kernel`, `packages`, `services`, and `users` are emitted.
-//! Unprobed `meta` fields (`timezone`, `arch_level`, `locale`,
-//! `keymap`) emit conservative defaults that the operator hand-edits
-//! after reconcile lands the file at
-//! `<config_dir>/hosts/<host>.imported.ncl`. Subsequent chunks add the
-//! config-file block.
+//! All [`DeclaredState`](pearlite_schema::DeclaredState) blocks
+//! relevant to a fresh import are emitted: `meta`, `kernel`,
+//! `packages`, `config`, `services`, and `users`. Unprobed `meta`
+//! fields (`timezone`, `arch_level`, `locale`, `keymap`) emit
+//! conservative defaults that the operator hand-edits after reconcile
+//! lands the file at `<config_dir>/hosts/<host>.imported.ncl`.
+//!
+//! ## Config-block caveat
+//!
+//! `config` is emitted as an empty array of tables. Probing populates
+//! [`ConfigFileInventory`](pearlite_schema::ConfigFileInventory) by
+//! stat-ing each *declared* target (see
+//! `pearlite_fs::inventory::probe_config_files`); a fresh-reconcile
+//! run has no declarations, so the inventory is empty by construction.
+//! Even when a partial inventory exists from prior declarations, the
+//! imported.ncl is a *new* draft for hand-curation rather than a
+//! round-trip of existing entries — re-emitting them with a
+//! placeholder `source` would override the operator's real config-repo
+//! paths. Operators add [`ConfigEntry`](pearlite_schema::ConfigEntry)
+//! tables manually during reconcile review.
 //!
 //! ## Users-block caveat
 //!
@@ -87,10 +101,15 @@ pub fn emit_host(probed: &ProbedState) -> String {
     push_meta(&mut out, &probed.host.hostname);
     push_kernel(&mut out, &probed.kernel.package);
     push_packages(&mut out, probed.pacman.as_ref(), probed.cargo.as_ref());
+    push_config(&mut out);
     push_services(&mut out, probed.services.as_ref());
     push_users(&mut out);
     out.push_str("}\n");
     out
+}
+
+fn push_config(out: &mut String) {
+    out.push_str("  config = [],\n");
 }
 
 fn push_users(out: &mut String) {
@@ -461,6 +480,27 @@ mod tests {
             packages_at < services_at,
             "packages must precede services for stable golden-fixture diffs"
         );
+    }
+
+    #[test]
+    fn emit_config_emits_empty_array_placeholder() {
+        // ConfigFileInventory is keyed on declared targets; a fresh
+        // reconcile has none, so the block is always empty.
+        let out = emit_host(&probed_with("forge", "linux-cachyos"));
+        assert!(out.contains("config = [],"));
+    }
+
+    #[test]
+    fn emit_config_appears_between_packages_and_services() {
+        // DeclaredState field order: meta, kernel, packages, config,
+        // services, users. The emitter mirrors it for stable
+        // golden-fixture diffs.
+        let out = emit_host(&probed_with("forge", "linux-cachyos"));
+        let packages_at = out.find("packages = ").expect("packages block");
+        let config_at = out.find("config = ").expect("config block");
+        let services_at = out.find("services = ").expect("services block");
+        assert!(packages_at < config_at, "config must follow packages");
+        assert!(config_at < services_at, "config must precede services");
     }
 
     #[test]
