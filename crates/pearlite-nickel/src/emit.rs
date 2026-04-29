@@ -9,11 +9,24 @@
 //!
 //! ## Scope (this chunk)
 //!
-//! `meta`, `kernel`, `packages`, and `services` are emitted. Unprobed
-//! `meta` fields (`timezone`, `arch_level`, `locale`, `keymap`) emit
-//! conservative defaults that the operator hand-edits after reconcile
-//! lands the file at `<config_dir>/hosts/<host>.imported.ncl`.
-//! Subsequent chunks add the `users` and config-file blocks.
+//! `meta`, `kernel`, `packages`, `services`, and `users` are emitted.
+//! Unprobed `meta` fields (`timezone`, `arch_level`, `locale`,
+//! `keymap`) emit conservative defaults that the operator hand-edits
+//! after reconcile lands the file at
+//! `<config_dir>/hosts/<host>.imported.ncl`. Subsequent chunks add the
+//! config-file block.
+//!
+//! ## Users-block caveat
+//!
+//! [`ProbedState`] carries no user inventory — Pearlite manages
+//! declared users (Plan §6.7) but does not enumerate `/etc/passwd` at
+//! probe time, since reconcile-without-declarations would surface
+//! every system account (root, daemon, http, etc.) as drift. The
+//! emitter therefore writes `users = []` as a placeholder; the
+//! operator is expected to add `UserDecl` entries by hand after the
+//! initial import. A populated users inventory is a v1.1 candidate
+//! (PRD §17.1) and would slot in here without changing the block
+//! shape.
 //!
 //! ## Services-block caveat
 //!
@@ -75,8 +88,13 @@ pub fn emit_host(probed: &ProbedState) -> String {
     push_kernel(&mut out, &probed.kernel.package);
     push_packages(&mut out, probed.pacman.as_ref(), probed.cargo.as_ref());
     push_services(&mut out, probed.services.as_ref());
+    push_users(&mut out);
     out.push_str("}\n");
     out
+}
+
+fn push_users(out: &mut String) {
+    out.push_str("  users = [],\n");
 }
 
 fn push_meta(out: &mut String, hostname: &str) {
@@ -442,6 +460,28 @@ mod tests {
         assert!(
             packages_at < services_at,
             "packages must precede services for stable golden-fixture diffs"
+        );
+    }
+
+    #[test]
+    fn emit_users_emits_empty_array_placeholder() {
+        // ProbedState carries no user inventory, so the emitter writes
+        // a literal empty array — the operator hand-edits after the
+        // imported.ncl lands.
+        let out = emit_host(&probed_with("forge", "linux-cachyos"));
+        assert!(out.contains("users = [],"));
+    }
+
+    #[test]
+    fn emit_users_appears_after_services() {
+        let mut probed = probed_with("forge", "linux-cachyos");
+        probed.services = Some(make_services(&["sshd.service"], &[], &[]));
+        let out = emit_host(&probed);
+        let services_at = out.find("services = ").expect("services block");
+        let users_at = out.find("users = ").expect("users block");
+        assert!(
+            services_at < users_at,
+            "users must follow services for stable golden-fixture diffs"
         );
     }
 
