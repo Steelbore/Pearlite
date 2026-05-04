@@ -86,13 +86,13 @@
 ### Week 1 — Adapter and bootstrap
 - [✓] `pearlite-userenv` with `HomeManagerBackend` (PR #44)
 - [✓] `DeterminateNixInstaller` (hash-pinned curl|sh) + `MockInstaller` (PR #45)
-- [~] `runuser` drop wrapper; per-user `nix.conf` handling — runuser wrap shipped via `LiveHmBackend`; per-user `nix.conf` provisioning deferred to M4 alongside the bootstrap-config story
+- [✓] `runuser` drop wrapper; per-user `nix.conf` handling — runuser wrap shipped via `LiveHmBackend`; bootstrap-config story landed in M4 W1 (PRs #55–#58); per-user `nix.conf` resolved as Home Manager's responsibility per ADR-0013
 
 ### Week 2 — Engine integration
 - [✓] Wire phase 7 into `pearlite-engine::apply` (PRs #46 / #47 / #50)
 - [✓] Extend `state.toml` schema with `[[managed.user_env]]` (PR #50; schema already shipped in M1)
 - [✓] `pearlite-diff` surfaces HM config-hash drift (PRs #48 / #49)
-- [✓] VM scenarios: `vm-07` user-env apply, `vm-08` user-env drift (PR #51); `vm-09` Nix bootstrap deferred until `LiveNixInstaller` has a wired apply-time caller (M4 W1)
+- [✓] VM scenarios: `vm-07` user-env apply, `vm-08` user-env drift (PR #51); `vm-09` Nix bootstrap shipped in M4 W1 (PR #59)
 - [~] Tag `m3-exit` (signed tag from this commit)
 
 ---
@@ -100,7 +100,7 @@
 ## M4 — Reconcile and Codify (2 weeks)
 
 ### Week 1 — Reconcile flow
-- [ ] `pearlite-engine::reconcile()` (read-only) → writes `hosts/<host>.imported.ncl`
+- [✓] `pearlite-engine::reconcile()` (read-only) → writes `hosts/<host>.imported.ncl` (PR #65)
 - [ ] `pearlite-engine::reconcile_commit()` — interactive prompts, drift threshold safety, state.toml write
 - [ ] `pearlite reconcile`, `reconcile --commit`, `--adopt-all`
 - [ ] VM scenario `vm-10-reconcile-fresh-install.sh`
@@ -187,4 +187,4 @@ Defer until ADR is written; each blocks a specific milestone exit.
 
 ---
 
-*Last updated: 2026-04-27. Mirrors `Pearlite-Plan-v1.0.docx`.*
+*Last updated: 2026-05-04. Mirrors `Pearlite-Plan-v1.0.docx`.*
