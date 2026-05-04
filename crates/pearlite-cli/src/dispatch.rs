@@ -2458,7 +2458,10 @@ expected_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
             "imported_path was {path_str}"
         );
         assert!(
-            config_dir.join("hosts").join("forge.imported.ncl").is_file(),
+            config_dir
+                .join("hosts")
+                .join("forge.imported.ncl")
+                .is_file(),
             "imported.ncl was not written to disk"
         );
     }
@@ -2483,8 +2486,7 @@ expected_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
         assert_eq!(err.class, "preflight");
         assert_eq!(err.exit_code, 2);
         // Pre-seeded file must be untouched.
-        let preserved =
-            std::fs::read_to_string(hosts.join("forge.imported.ncl")).expect("read");
+        let preserved = std::fs::read_to_string(hosts.join("forge.imported.ncl")).expect("read");
         assert_eq!(preserved, "prior");
     }
 
