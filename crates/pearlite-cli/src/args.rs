@@ -162,6 +162,20 @@ pub enum Command {
         #[arg(long, default_value = "/etc/nix/nix.conf")]
         nix_conf: PathBuf,
     },
+    /// Probe the live system and write a fresh
+    /// `<config_dir>/hosts/<hostname>.imported.ncl` for operator review.
+    ///
+    /// Read-only with respect to `state.toml`: probes pacman, cargo,
+    /// systemd, and the kernel via `Engine::reconcile`, renders the
+    /// result through `pearlite_nickel::emit_host`, and lands the text
+    /// at the imported path. Refuses to clobber an existing
+    /// `.imported.ncl` — `RECONCILE_ALREADY_EXISTS` surfaces and the
+    /// operator removes or renames it before retrying.
+    ///
+    /// The interactive `--commit` and `--adopt-all` flags that mutate
+    /// `state.toml` ride along with `Engine::reconcile_commit` in a
+    /// follow-up PR (M4 W1 remainder).
+    Reconcile,
 }
 
 /// Sub-actions for [`Command::Gen`].
