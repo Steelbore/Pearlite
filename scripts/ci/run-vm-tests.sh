@@ -5,12 +5,11 @@
 # Pearlite VM-tier (T4) test runner. Wired into `just vm-test` and
 # `.github/workflows/vm.yml`.
 #
-# Iterates every `tests/vm/vm-*.sh` script in name order. The first
-# script (`vm-01-bootstrap-and-plan.sh`) is read-only and runs
-# unconditionally. Mutating scripts (`vm-02` and onward) require
-# `PEARLITE_VM_TEST=1` because they install/remove packages, write to
-# `/etc`, and take Snapper snapshots — run only inside a disposable
-# CachyOS VM.
+# Iterates every `tests/vm/vm-*.sh` script in name order. Read-only
+# scripts (`vm-01-*`, `vm-10-*`) run unconditionally. Mutating scripts
+# (everything else) require `PEARLITE_VM_TEST=1` because they
+# install/remove packages, write to `/etc`, and take Snapper snapshots
+# -- run only inside a disposable CachyOS VM.
 #
 # POSIX sh; no Bash-isms.
 
@@ -38,7 +37,7 @@ for script in tests/vm/vm-*.sh; do
     [ -f "$script" ] || continue
     name=$(basename "$script")
     case "$name" in
-        vm-01-*)
+        vm-01-*|vm-10-*)
             # Read-only; always runs.
             ;;
         *)
