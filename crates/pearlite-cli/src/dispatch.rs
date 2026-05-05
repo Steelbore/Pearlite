@@ -70,32 +70,7 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
 
     match &args.command {
         Command::Plan { host_file } | Command::Status { host_file } => {
-            let host_path = host_file
-                .clone()
-                .unwrap_or_else(|| default_host_file(&args.config_dir, &ctx.fallback_host));
-            let state = match read_state_or_empty(&ctx.state_path, &ctx.fallback_host) {
-                Ok(s) => s,
-                Err(payload) => {
-                    return Envelope::failure(metadata_at(None), payload);
-                }
-            };
-            match ctx.engine.plan(&host_path, &state, false) {
-                Ok(plan) => match serde_json::to_value(&plan) {
-                    Ok(v) => Envelope::success(metadata_at(Some(plan.host)), v),
-                    Err(e) => Envelope::failure(
-                        metadata_at(None),
-                        ErrorPayload {
-                            code: "RENDER_FAILED".to_owned(),
-                            class: "internal".to_owned(),
-                            exit_code: 1,
-                            message: format!("could not serialize plan: {e}"),
-                            hint: "report this as a Pearlite bug".to_owned(),
-                            details: serde_json::Value::Null,
-                        },
-                    ),
-                },
-                Err(e) => Envelope::failure(metadata_at(None), engine_error_payload(&e)),
-            }
+            dispatch_plan_or_status(args, ctx, host_file.as_ref(), &metadata_at)
         }
         Command::Apply {
             host_file,
@@ -157,6 +132,48 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
                 )
             }
         }
+    }
+}
+
+/// Dispatch arm for `pearlite plan` and `pearlite status`.
+///
+/// Both subcommands share the same read-only flow: load the state file
+/// (tolerating its absence — a fresh host has no `state.toml` yet),
+/// run [`Engine::plan`], and either serialize the plan or surface a
+/// typed error payload. Pulled out of [`dispatch`] so the top-level
+/// match stays under clippy's `too_many_lines` limit; logic is
+/// otherwise identical to the previous inline form.
+fn dispatch_plan_or_status(
+    args: &Args,
+    ctx: &RunContext,
+    host_file: Option<&PathBuf>,
+    metadata_at: &dyn Fn(Option<String>) -> Metadata,
+) -> Envelope {
+    let host_path = host_file
+        .cloned()
+        .unwrap_or_else(|| default_host_file(&args.config_dir, &ctx.fallback_host));
+    let state = match read_state_or_empty(&ctx.state_path, &ctx.fallback_host) {
+        Ok(s) => s,
+        Err(payload) => {
+            return Envelope::failure(metadata_at(None), payload);
+        }
+    };
+    match ctx.engine.plan(&host_path, &state, false) {
+        Ok(plan) => match serde_json::to_value(&plan) {
+            Ok(v) => Envelope::success(metadata_at(Some(plan.host)), v),
+            Err(e) => Envelope::failure(
+                metadata_at(None),
+                ErrorPayload {
+                    code: "RENDER_FAILED".to_owned(),
+                    class: "internal".to_owned(),
+                    exit_code: 1,
+                    message: format!("could not serialize plan: {e}"),
+                    hint: "report this as a Pearlite bug".to_owned(),
+                    details: serde_json::Value::Null,
+                },
+            ),
+        },
+        Err(e) => Envelope::failure(metadata_at(None), engine_error_payload(&e)),
     }
 }
 
