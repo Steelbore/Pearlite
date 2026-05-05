@@ -103,7 +103,7 @@
 - [✓] `pearlite-engine::reconcile()` (read-only) → writes `hosts/<host>.imported.ncl` (PR #65)
 - [ ] `pearlite-engine::reconcile_commit()` — interactive prompts, drift threshold safety, state.toml write
 - [ ] `pearlite reconcile`, `reconcile --commit`, `--adopt-all`
-- [ ] VM scenario `vm-10-reconcile-fresh-install.sh`
+- [✓] VM scenario `vm-10-reconcile-fresh-install.sh` (PR #67)
 
 ### Week 2 — Codify and the sidecar
 - [ ] Codified sidecar emitter — deterministic, byte-identical re-emission
