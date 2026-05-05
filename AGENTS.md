@@ -108,6 +108,36 @@ The five-way taxonomy is fixed. Never invent a sixth.
 
 Get this wrong and Pearlite removes packages the user wants to keep.
 
+## Reconcile flow (PRD §11, M4 W1)
+
+`pearlite reconcile` (read-only) probes the live system and writes a fresh
+`<config_dir>/hosts/<hostname>.imported.ncl` as a **review draft** for operator
+hand-curation. The emitted Nickel record carries `meta`, `kernel`, `packages`,
+and `services` blocks from probe data; `users` and `config` are deliberately
+emitted as empty arrays per PRD §11 (no `/etc/passwd` enumeration; no clobbering
+of operator config-repo paths). The imported file is a draft, not a validated
+declaration — the operator hand-curates it and renames it to `<hostname>.ncl`
+for the next `pearlite plan`.
+
+The interactive counterpart `pearlite reconcile --commit` (M4 W1 remainder)
+commits the import to `state.toml` with a drift-threshold safety check. Until
+it lands, reconcile only writes the review draft.
+
+Error codes (all class 1 preflight, exit 2 — reconcile never mutates
+`state.toml` and a failed atomic write leaves the operator config repo
+untouched):
+
+| `error.code` | Triggers |
+|---|---|
+| `RECONCILE_PROBE_FAILED` | adapter failure during probe |
+| `RECONCILE_EMPTY_HOSTNAME` | blank `/etc/hostname` |
+| `RECONCILE_INVALID_HOSTNAME` | `/`, `\`, or NUL in hostname |
+| `RECONCILE_ALREADY_EXISTS` | refuses to clobber an existing imported.ncl |
+| `RECONCILE_IO_FAILED` | mkdir or atomic-write failure |
+
+VM-tier coverage: [`tests/vm/vm-10-reconcile-fresh-install.sh`](tests/vm/vm-10-reconcile-fresh-install.sh)
+exercises the read-side end-to-end (happy path + clobber refusal).
+
 ## Always
 
 - Run `cargo clippy --workspace --all-targets -- -D warnings` before claiming a
@@ -152,4 +182,4 @@ Do not propose names outside this convention.
 
 ---
 
-*Last updated: 2026-04-27.*
+*Last updated: 2026-05-04.*

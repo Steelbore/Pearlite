@@ -70,32 +70,7 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
 
     match &args.command {
         Command::Plan { host_file } | Command::Status { host_file } => {
-            let host_path = host_file
-                .clone()
-                .unwrap_or_else(|| default_host_file(&args.config_dir, &ctx.fallback_host));
-            let state = match read_state_or_empty(&ctx.state_path, &ctx.fallback_host) {
-                Ok(s) => s,
-                Err(payload) => {
-                    return Envelope::failure(metadata_at(None), payload);
-                }
-            };
-            match ctx.engine.plan(&host_path, &state, false) {
-                Ok(plan) => match serde_json::to_value(&plan) {
-                    Ok(v) => Envelope::success(metadata_at(Some(plan.host)), v),
-                    Err(e) => Envelope::failure(
-                        metadata_at(None),
-                        ErrorPayload {
-                            code: "RENDER_FAILED".to_owned(),
-                            class: "internal".to_owned(),
-                            exit_code: 1,
-                            message: format!("could not serialize plan: {e}"),
-                            hint: "report this as a Pearlite bug".to_owned(),
-                            details: serde_json::Value::Null,
-                        },
-                    ),
-                },
-                Err(e) => Envelope::failure(metadata_at(None), engine_error_payload(&e)),
-            }
+            dispatch_plan_or_status(args, ctx, host_file.as_ref(), &metadata_at)
         }
         Command::Apply {
             host_file,
@@ -138,6 +113,7 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
             nix_conf,
             &metadata_at,
         ),
+        Command::Reconcile => dispatch_reconcile(args, ctx, &metadata_at),
         Command::Schema { bare } => {
             if *bare {
                 Envelope::success(metadata_at(None), bare_schema())
@@ -156,6 +132,48 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
                 )
             }
         }
+    }
+}
+
+/// Dispatch arm for `pearlite plan` and `pearlite status`.
+///
+/// Both subcommands share the same read-only flow: load the state file
+/// (tolerating its absence — a fresh host has no `state.toml` yet),
+/// run [`Engine::plan`], and either serialize the plan or surface a
+/// typed error payload. Pulled out of [`dispatch`] so the top-level
+/// match stays under clippy's `too_many_lines` limit; logic is
+/// otherwise identical to the previous inline form.
+fn dispatch_plan_or_status(
+    args: &Args,
+    ctx: &RunContext,
+    host_file: Option<&PathBuf>,
+    metadata_at: &dyn Fn(Option<String>) -> Metadata,
+) -> Envelope {
+    let host_path = host_file
+        .cloned()
+        .unwrap_or_else(|| default_host_file(&args.config_dir, &ctx.fallback_host));
+    let state = match read_state_or_empty(&ctx.state_path, &ctx.fallback_host) {
+        Ok(s) => s,
+        Err(payload) => {
+            return Envelope::failure(metadata_at(None), payload);
+        }
+    };
+    match ctx.engine.plan(&host_path, &state, false) {
+        Ok(plan) => match serde_json::to_value(&plan) {
+            Ok(v) => Envelope::success(metadata_at(Some(plan.host)), v),
+            Err(e) => Envelope::failure(
+                metadata_at(None),
+                ErrorPayload {
+                    code: "RENDER_FAILED".to_owned(),
+                    class: "internal".to_owned(),
+                    exit_code: 1,
+                    message: format!("could not serialize plan: {e}"),
+                    hint: "report this as a Pearlite bug".to_owned(),
+                    details: serde_json::Value::Null,
+                },
+            ),
+        },
+        Err(e) => Envelope::failure(metadata_at(None), engine_error_payload(&e)),
     }
 }
 
@@ -405,6 +423,98 @@ fn bootstrap_error_payload(err: &pearlite_engine::BootstrapError) -> ErrorPayloa
             message: format!("reading existing /etc/nix/nix.conf failed: {e}"),
             hint: "check the file's permissions; re-run as root if needed".to_owned(),
             details: serde_json::Value::Null,
+        },
+    }
+}
+
+/// Dispatch arm for `pearlite reconcile` (read-only).
+///
+/// Probes the live system and writes
+/// `<config_dir>/hosts/<hostname>.imported.ncl` via
+/// [`Engine::reconcile`]. Does not touch `state.toml` — the operator
+/// reviews the import, hand-curates it, and renames it to
+/// `<hostname>.ncl` for `pearlite plan` to pick up. The interactive
+/// `--commit` and `--adopt-all` flags (which DO mutate state) ride
+/// along with `Engine::reconcile_commit` in a follow-up PR.
+fn dispatch_reconcile(
+    args: &Args,
+    ctx: &RunContext,
+    metadata_at: &dyn Fn(Option<String>) -> Metadata,
+) -> Envelope {
+    match ctx.engine.reconcile(&args.config_dir) {
+        Ok(outcome) => Envelope::success(
+            metadata_at(Some(outcome.hostname.clone())),
+            reconcile_outcome_view(&outcome),
+        ),
+        Err(e) => Envelope::failure(metadata_at(None), reconcile_error_payload(&e)),
+    }
+}
+
+/// Render-friendly view of [`pearlite_engine::ReconcileOutcome`].
+fn reconcile_outcome_view(outcome: &pearlite_engine::ReconcileOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "imported_path": outcome.path.to_string_lossy(),
+        "hostname": outcome.hostname,
+    })
+}
+
+/// Map `ReconcileError` to a typed [`ErrorPayload`].
+///
+/// Reconcile is class 1 (preflight) throughout: the only system-side
+/// effect is the atomic write of the `.imported.ncl` file, and a
+/// failure of that write leaves the operator's config repo untouched
+/// (the temp file is dropped). `state.toml` is never read or written
+/// on this path, so no recoverable/incoherent classes apply.
+fn reconcile_error_payload(err: &pearlite_engine::ReconcileError) -> ErrorPayload {
+    use pearlite_engine::ReconcileError as R;
+    match err {
+        R::Probe(e) => ErrorPayload {
+            code: "RECONCILE_PROBE_FAILED".to_owned(),
+            class: "preflight".to_owned(),
+            exit_code: 2,
+            message: format!("probing live system failed: {e}"),
+            hint: "run `pearlite plan` first to surface the underlying probe error".to_owned(),
+            details: serde_json::Value::Null,
+        },
+        R::EmptyHostname => ErrorPayload {
+            code: "RECONCILE_EMPTY_HOSTNAME".to_owned(),
+            class: "preflight".to_owned(),
+            exit_code: 2,
+            message: "probe returned an empty hostname".to_owned(),
+            hint: "set /etc/hostname to a non-empty value, then re-run `pearlite reconcile`"
+                .to_owned(),
+            details: serde_json::Value::Null,
+        },
+        R::InvalidHostname { hostname } => ErrorPayload {
+            code: "RECONCILE_INVALID_HOSTNAME".to_owned(),
+            class: "preflight".to_owned(),
+            exit_code: 2,
+            message: format!("hostname {hostname:?} is not a valid filename component"),
+            hint: "set /etc/hostname to an RFC-1123-compliant value (no `/`, `\\`, or NUL)"
+                .to_owned(),
+            details: serde_json::json!({ "hostname": hostname }),
+        },
+        R::AlreadyExists { path } => ErrorPayload {
+            code: "RECONCILE_ALREADY_EXISTS".to_owned(),
+            class: "preflight".to_owned(),
+            exit_code: 2,
+            message: format!("{} already exists", path.display()),
+            hint: format!(
+                "rm {} or rename it before re-running `pearlite reconcile`",
+                path.display()
+            ),
+            details: serde_json::json!({ "path": path.to_string_lossy() }),
+        },
+        R::Io { path, source } => ErrorPayload {
+            code: "RECONCILE_IO_FAILED".to_owned(),
+            class: "preflight".to_owned(),
+            exit_code: 2,
+            message: format!("I/O error at {}: {source}", path.display()),
+            hint: format!(
+                "ensure pearlite can write to {}; re-run as the user who owns the config repo",
+                path.display()
+            ),
+            details: serde_json::json!({ "path": path.to_string_lossy() }),
         },
     }
 }
@@ -693,6 +803,7 @@ fn label_for(command: &Command) -> String {
         },
         Command::Schema { .. } => "pearlite schema".to_owned(),
         Command::Bootstrap { .. } => "pearlite bootstrap".to_owned(),
+        Command::Reconcile => "pearlite reconcile".to_owned(),
     }
 }
 
@@ -2324,5 +2435,88 @@ expected_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
             "missing state file must be tolerated, got {:?}",
             env.error
         );
+    }
+
+    fn args_for_reconcile(config_dir: PathBuf, state_file: PathBuf) -> Args {
+        Args {
+            format: OutputFormat::Json,
+            config_dir,
+            state_file,
+            command: Command::Reconcile,
+        }
+    }
+
+    #[test]
+    fn reconcile_dispatches_through_engine_and_writes_imported_ncl() {
+        let dir = TempDir::new().expect("tempdir");
+        let config_dir = dir.path().join("repo");
+        let state_path = dir.path().join("state.toml");
+        // ctx_with seeds a host file path into MockNickel, but reconcile
+        // never consults the evaluator (see reconcile.rs:174). Any path
+        // is fine here.
+        let host = config_dir.join("hosts").join("forge.ncl");
+
+        let ctx = ctx_with(host, MINIMAL_HOST, state_path.clone());
+        let args = args_for_reconcile(config_dir.clone(), state_path);
+        let env = dispatch(&args, &ctx);
+
+        assert!(env.error.is_none(), "got error {:?}", env.error);
+        let data = env.data.expect("data populated");
+        assert_eq!(
+            data.get("hostname").and_then(serde_json::Value::as_str),
+            Some("forge")
+        );
+        let path_str = data
+            .get("imported_path")
+            .and_then(serde_json::Value::as_str)
+            .expect("imported_path");
+        assert!(
+            path_str.ends_with("forge.imported.ncl"),
+            "imported_path was {path_str}"
+        );
+        assert!(
+            config_dir
+                .join("hosts")
+                .join("forge.imported.ncl")
+                .is_file(),
+            "imported.ncl was not written to disk"
+        );
+    }
+
+    #[test]
+    fn reconcile_surfaces_already_exists_when_file_present() {
+        let dir = TempDir::new().expect("tempdir");
+        let config_dir = dir.path().join("repo");
+        let hosts = config_dir.join("hosts");
+        std::fs::create_dir_all(&hosts).expect("mkdir");
+        std::fs::write(hosts.join("forge.imported.ncl"), b"prior").expect("seed");
+
+        let state_path = dir.path().join("state.toml");
+        let host = config_dir.join("hosts").join("forge.ncl");
+
+        let ctx = ctx_with(host, MINIMAL_HOST, state_path.clone());
+        let args = args_for_reconcile(config_dir.clone(), state_path);
+        let env = dispatch(&args, &ctx);
+
+        let err = env.error.expect("must error");
+        assert_eq!(err.code, "RECONCILE_ALREADY_EXISTS");
+        assert_eq!(err.class, "preflight");
+        assert_eq!(err.exit_code, 2);
+        // Pre-seeded file must be untouched.
+        let preserved = std::fs::read_to_string(hosts.join("forge.imported.ncl")).expect("read");
+        assert_eq!(preserved, "prior");
+    }
+
+    #[test]
+    fn reconcile_metadata_command_label() {
+        let dir = TempDir::new().expect("tempdir");
+        let config_dir = dir.path().join("repo");
+        let state_path = dir.path().join("state.toml");
+        let host = config_dir.join("hosts").join("forge.ncl");
+
+        let ctx = ctx_with(host, MINIMAL_HOST, state_path.clone());
+        let args = args_for_reconcile(config_dir, state_path);
+        let env = dispatch(&args, &ctx);
+        assert_eq!(env.metadata.command, "pearlite reconcile");
     }
 }
