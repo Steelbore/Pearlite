@@ -58,6 +58,15 @@ Concretely:
    and aborts with `RECONCILE_THRESHOLD_EXCEEDED` (class
    `preflight`, exit 2) before the engine method runs. Same
    mechanism / policy split as ADR-0011.
+
+   The `error.message` MUST name both the count and the threshold,
+   and explicitly surface the fresh-install case: on a brand-new
+   host `state.toml` is empty and every explicit package classifies
+   as Manual, so the threshold always trips on first reconcile. The
+   message points the operator at `--adopt-all` for fresh-install
+   bulk adoption, and at `--commit-threshold N` for audited real
+   drift. `error.hint` (per CLAUDE.md, must be a runnable command):
+   `pearlite reconcile --commit --adopt-all`.
 3. **`--adopt-all` bypasses the threshold and the prompts**, accepts
    every Manual item, and is *combinable* with
    `--commit-threshold N` to cap blast radius even when bypassing
@@ -71,9 +80,14 @@ Concretely:
 5. **Non-interactive (no TTY, or any of `AI_AGENT=1` / `AGENT=1` /
    `CI=true`) without `--adopt-all`:** refuse with
    `RECONCILE_REQUIRES_INTERACTIVE` (class `preflight`, exit 2).
-   Hint: `pearlite reconcile --commit --adopt-all` (or run from a
-   TTY). This protects against silent mass-adoption when no operator
-   is watching.
+   This protects against silent mass-adoption when no operator is
+   watching.
+
+   The `error.message` MUST name the count of pending drift items
+   *and* state the reason: adoption is a per-package operator
+   judgment that requires a human decision, and no TTY (or agent
+   prompt surface) was detected to receive the prompts. `error.hint`:
+   `pearlite reconcile --commit --adopt-all` (or re-run from a TTY).
 6. **Env-var detection** lives behind
    `pearlite_cli::agents::is_non_interactive()`, a helper that ships
    in the M4 implementation PR as a stub returning
