@@ -7,6 +7,7 @@
 //! --bare` into the engine's read-only path. Apply, rollback, reconcile,
 //! the per-provider schema formats, and the MCP server arrive in M2+.
 
+pub mod agents;
 mod args;
 mod dispatch;
 mod envelope;

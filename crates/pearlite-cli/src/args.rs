@@ -165,17 +165,41 @@ pub enum Command {
     /// Probe the live system and write a fresh
     /// `<config_dir>/hosts/<hostname>.imported.ncl` for operator review.
     ///
-    /// Read-only with respect to `state.toml`: probes pacman, cargo,
-    /// systemd, and the kernel via `Engine::reconcile`, renders the
-    /// result through `pearlite_nickel::emit_host`, and lands the text
-    /// at the imported path. Refuses to clobber an existing
+    /// Read-only with respect to `state.toml` by default: probes pacman,
+    /// cargo, systemd, and the kernel via `Engine::reconcile`, renders
+    /// the result through `pearlite_nickel::emit_host`, and lands the
+    /// text at the imported path. Refuses to clobber an existing
     /// `.imported.ncl` — `RECONCILE_ALREADY_EXISTS` surfaces and the
     /// operator removes or renames it before retrying.
     ///
-    /// The interactive `--commit` and `--adopt-all` flags that mutate
-    /// `state.toml` ride along with `Engine::reconcile_commit` in a
-    /// follow-up PR (M4 W1 remainder).
-    Reconcile,
+    /// Pass `--commit` to additionally promote Manual drift items into
+    /// `state.adopted` and append a `[[reconciliations]]` entry
+    /// (ADR-0014). The default threshold of 5 protects against silent
+    /// mass-adoption on a stale or unexpectedly-drifted host; raise it
+    /// with `--commit-threshold N` or bypass it entirely with
+    /// `--adopt-all`.
+    Reconcile {
+        /// Mutate `state.toml`: adopt Manual drift items into
+        /// `state.adopted` and append a `[[reconciliations]]` entry
+        /// (ADR-0014). Without this flag, `pearlite reconcile` only
+        /// writes the `.imported.ncl` review draft.
+        #[arg(long)]
+        commit: bool,
+        /// Bypass per-package prompts and adopt every Manual drift
+        /// item. Required for non-interactive invocations (no TTY,
+        /// `AI_AGENT=1`). Implies `--commit`. Combinable with
+        /// `--commit-threshold N` to cap blast radius even when
+        /// bypassing prompts (ADR-0014 §3).
+        #[arg(long, requires = "commit")]
+        adopt_all: bool,
+        /// Maximum number of Manual drift items reconcile-commit will
+        /// adopt without explicit override. When omitted, defaults to
+        /// 5 per ADR-0014 §1; bare `--adopt-all` (no threshold)
+        /// disables the cap entirely. Above the threshold, the CLI
+        /// refuses with `RECONCILE_THRESHOLD_EXCEEDED`.
+        #[arg(long, requires = "commit")]
+        commit_threshold: Option<u32>,
+    },
 }
 
 /// Sub-actions for [`Command::Gen`].
