@@ -6,10 +6,10 @@
 # `.github/workflows/vm.yml`.
 #
 # Iterates every `tests/vm/vm-*.sh` script in name order. Read-only
-# scripts (`vm-01-*`, `vm-10-*`) run unconditionally. Mutating scripts
-# (everything else) require `PEARLITE_VM_TEST=1` because they
-# install/remove packages, write to `/etc`, and take Snapper snapshots
-# -- run only inside a disposable CachyOS VM.
+# scripts (`vm-01-*`, `vm-10-*`, `vm-11-*`) run unconditionally.
+# Mutating scripts (everything else) require `PEARLITE_VM_TEST=1`
+# because they install/remove packages, write to `/etc`, and take
+# Snapper snapshots -- run only inside a disposable CachyOS VM.
 #
 # POSIX sh; no Bash-isms.
 
@@ -37,8 +37,8 @@ for script in tests/vm/vm-*.sh; do
     [ -f "$script" ] || continue
     name=$(basename "$script")
     case "$name" in
-        vm-01-*|vm-10-*)
-            # Read-only; always runs.
+        vm-01-*|vm-10-*|vm-11-*)
+            # Read-only with respect to system state; always runs.
             ;;
         *)
             if [ "$mutating_allowed" -ne 1 ]; then
