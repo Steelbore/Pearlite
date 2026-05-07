@@ -18,11 +18,12 @@ mod rollback;
 pub use apply::{ApplyContext, ApplyOutcome, FailureRecord};
 pub use bootstrap::BootstrapOutcome;
 pub use errors::{
-    ApplyError, BootstrapError, EngineError, ProbeError, ReconcileError, RollbackError,
+    ApplyError, BootstrapError, EngineError, ProbeError, ReconcileCommitError, ReconcileError,
+    RollbackError,
 };
 pub use plan::Engine;
 pub use probe::{LiveProbe, SystemProbe};
-pub use reconcile::ReconcileOutcome;
+pub use reconcile::{ReconcileCommitOutcome, ReconcileDecisions, ReconcileOutcome};
 pub use rollback::RollbackOutcome;
 
 #[cfg(any(test, feature = "test-mocks"))]

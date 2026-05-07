@@ -172,6 +172,35 @@ pub enum ReconcileError {
     },
 }
 
+/// Errors emitted by
+/// [`Engine::reconcile_commit`](crate::Engine::reconcile_commit) (ADR-0014,
+/// M4 W1).
+///
+/// `reconcile_commit` resolves the Manual drift surfaced by reconcile by
+/// promoting items into `state.adopted` and recording a
+/// `[[reconciliations]]` entry. Variants identify whether the failure was
+/// on the probe side, the state read/write side, or the threshold-guard.
+#[derive(Debug, Error)]
+pub enum ReconcileCommitError {
+    /// Probing the live system failed.
+    #[error(transparent)]
+    Probe(#[from] ProbeError),
+    /// `state.toml` read or write failed.
+    #[error(transparent)]
+    State(#[from] pearlite_state::StateError),
+    /// Engine-side threshold guard: the count of Manual drift items
+    /// exceeds the supplied limit. Defense-in-depth — the CLI normally
+    /// aborts with `RECONCILE_THRESHOLD_EXCEEDED` before the engine
+    /// runs (ADR-0014 §2).
+    #[error("reconcile-commit refused: {count} Manual items exceeds threshold {threshold}")]
+    ThresholdExceeded {
+        /// Number of Manual drift items found.
+        count: u32,
+        /// Threshold the caller asked the engine to enforce.
+        threshold: u32,
+    },
+}
+
 /// Errors emitted by [`Engine::plan`](crate::Engine::plan) and friends.
 #[derive(Debug, Error)]
 pub enum EngineError {
