@@ -303,6 +303,8 @@ mod tests {
             committed_at: epoch(),
             action: ReconciliationAction::Interactive,
             package_count: 5,
+            adopted: vec!["htop".to_owned(), "ripgrep".to_owned()],
+            skipped: vec!["broken-aur-pkg".to_owned()],
         };
         store.record_reconciliation(entry.clone()).expect("append");
 
