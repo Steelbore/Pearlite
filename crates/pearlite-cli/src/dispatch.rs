@@ -12,9 +12,16 @@ use pearlite_snapper::Snapper;
 use pearlite_state::{State, StateError, StateStore};
 use pearlite_systemd::Systemd;
 use pearlite_userenv::{HomeManagerBackend, NixInstaller};
+use std::collections::BTreeSet;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use time::OffsetDateTime;
+
+/// Default Manual-drift threshold for `pearlite reconcile --commit`
+/// when neither `--commit-threshold` nor bare `--adopt-all` is passed
+/// (ADR-0014 §1).
+const DEFAULT_RECONCILE_COMMIT_THRESHOLD: u32 = 5;
 
 /// Runtime context the dispatcher uses to talk to the engine.
 ///
@@ -113,7 +120,20 @@ pub fn dispatch(args: &Args, ctx: &RunContext) -> Envelope {
             nix_conf,
             &metadata_at,
         ),
-        Command::Reconcile => dispatch_reconcile(args, ctx, &metadata_at),
+        Command::Reconcile {
+            commit,
+            adopt_all,
+            commit_threshold,
+        } => dispatch_reconcile(
+            args,
+            ctx,
+            &ReconcileOpts {
+                commit: *commit,
+                adopt_all: *adopt_all,
+                commit_threshold: *commit_threshold,
+            },
+            &metadata_at,
+        ),
         Command::Schema { bare } => {
             if *bare {
                 Envelope::success(metadata_at(None), bare_schema())
@@ -427,26 +447,180 @@ fn bootstrap_error_payload(err: &pearlite_engine::BootstrapError) -> ErrorPayloa
     }
 }
 
-/// Dispatch arm for `pearlite reconcile` (read-only).
+/// CLI-shaped `pearlite reconcile` options threaded through dispatch.
+struct ReconcileOpts {
+    /// Mutate `state.toml` (ADR-0014). Without this flag, only the
+    /// `.imported.ncl` review draft is written.
+    commit: bool,
+    /// Bypass per-package prompts and adopt every Manual drift item.
+    adopt_all: bool,
+    /// Operator-supplied threshold. When `commit && !adopt_all`, an
+    /// unset value falls back to [`DEFAULT_RECONCILE_COMMIT_THRESHOLD`].
+    commit_threshold: Option<u32>,
+}
+
+impl ReconcileOpts {
+    /// Effective threshold to hand to the engine and enforce in the
+    /// CLI:
+    /// - bare `--adopt-all`           → `None` (uncapped, ADR-0014 §3).
+    /// - `--adopt-all --commit-threshold N` → `Some(N)`.
+    /// - bare `--commit`              → `Some(DEFAULT…)`.
+    /// - `--commit --commit-threshold N`    → `Some(N)`.
+    fn effective_threshold(&self) -> Option<u32> {
+        match (self.adopt_all, self.commit_threshold) {
+            (true, None) => None,
+            (true | false, Some(n)) => Some(n),
+            (false, None) => Some(DEFAULT_RECONCILE_COMMIT_THRESHOLD),
+        }
+    }
+}
+
+/// Dispatch arm for `pearlite reconcile` (read-only or commit).
 ///
-/// Probes the live system and writes
+/// Without `--commit` the command stays read-only and writes only
 /// `<config_dir>/hosts/<hostname>.imported.ncl` via
-/// [`Engine::reconcile`]. Does not touch `state.toml` — the operator
-/// reviews the import, hand-curates it, and renames it to
-/// `<hostname>.ncl` for `pearlite plan` to pick up. The interactive
-/// `--commit` and `--adopt-all` flags (which DO mutate state) ride
-/// along with `Engine::reconcile_commit` in a follow-up PR.
+/// [`Engine::reconcile`]; the operator hand-curates it and renames to
+/// `<hostname>.ncl` for the next `pearlite plan` to pick up.
+///
+/// With `--commit` the command additionally mutates `state.toml`
+/// (ADR-0014). The flow:
+///
+/// 1. Refuse non-interactive invocations without `--adopt-all`
+///    (`RECONCILE_REQUIRES_INTERACTIVE`).
+/// 2. With `--adopt-all`: dispatch directly to
+///    [`Engine::reconcile_commit`] with `ReconcileDecisions::AdoptAll`
+///    and the effective threshold.
+/// 3. Without `--adopt-all`: probe + classify Manual drift in the CLI;
+///    if the count exceeds the threshold, refuse with
+///    `RECONCILE_THRESHOLD_EXCEEDED` (ADR-0014 §2 wording — names
+///    count, threshold, and the fresh-install case); otherwise run
+///    the per-package prompt loop and dispatch with
+///    `ReconcileDecisions::Selective`.
+///
+/// `q` (quit) at any prompt aborts without touching `state.toml`; the
+/// envelope reports `aborted: true` and zero adoptions.
 fn dispatch_reconcile(
     args: &Args,
     ctx: &RunContext,
+    opts: &ReconcileOpts,
     metadata_at: &dyn Fn(Option<String>) -> Metadata,
 ) -> Envelope {
-    match ctx.engine.reconcile(&args.config_dir) {
+    if !opts.commit {
+        return match ctx.engine.reconcile(&args.config_dir) {
+            Ok(outcome) => Envelope::success(
+                metadata_at(Some(outcome.hostname.clone())),
+                reconcile_outcome_view(&outcome),
+            ),
+            Err(e) => Envelope::failure(metadata_at(None), reconcile_error_payload(&e)),
+        };
+    }
+
+    dispatch_reconcile_commit(
+        ctx,
+        opts,
+        crate::agents::is_non_interactive(),
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr().lock(),
+        metadata_at,
+    )
+}
+
+/// Stream-driven implementation of `pearlite reconcile --commit`.
+///
+/// Split out from [`dispatch_reconcile`] so tests can supply scripted
+/// stdin/stderr and an explicit `non_interactive` flag without going
+/// through the live TTY check in [`crate::agents::is_non_interactive`].
+fn dispatch_reconcile_commit<R: BufRead, W: Write>(
+    ctx: &RunContext,
+    opts: &ReconcileOpts,
+    non_interactive: bool,
+    input: &mut R,
+    output: &mut W,
+    metadata_at: &dyn Fn(Option<String>) -> Metadata,
+) -> Envelope {
+    if non_interactive && !opts.adopt_all {
+        return Envelope::failure(
+            metadata_at(None),
+            ErrorPayload {
+                code: "RECONCILE_REQUIRES_INTERACTIVE".to_owned(),
+                class: "preflight".to_owned(),
+                exit_code: 2,
+                message:
+                    "reconcile-commit needs an interactive operator: no TTY (or AI_AGENT=1) was \
+                     detected, and adoption is a per-package judgment that cannot be silently \
+                     defaulted (ADR-0014 §5)"
+                        .to_owned(),
+                hint: "pearlite reconcile --commit --adopt-all".to_owned(),
+                details: serde_json::Value::Null,
+            },
+        );
+    }
+
+    let threshold = opts.effective_threshold();
+
+    let (decisions, action_label) = if opts.adopt_all {
+        (pearlite_engine::ReconcileDecisions::AdoptAll, "adopt_all")
+    } else {
+        // Interactive path: probe + classify ourselves so we can
+        // (a) pre-check the threshold with a clean error code before
+        // any engine work, and (b) drive the per-package prompt loop.
+        let manual = match probe_manual_drift(ctx) {
+            Ok(m) => m,
+            Err(payload) => return Envelope::failure(metadata_at(None), payload),
+        };
+
+        if let Some(limit) = threshold {
+            let count = u32::try_from(manual.len()).unwrap_or(u32::MAX);
+            if count > limit {
+                return Envelope::failure(
+                    metadata_at(None),
+                    threshold_exceeded_payload(count, limit),
+                );
+            }
+        }
+
+        match run_prompt_loop(input, output, &manual) {
+            Ok(PromptOutcome::Quit) => {
+                return Envelope::success(
+                    metadata_at(None),
+                    serde_json::json!({
+                        "committed": false,
+                        "aborted": true,
+                        "considered": manual.len(),
+                        "adopted": [],
+                        "skipped": [],
+                    }),
+                );
+            }
+            Ok(PromptOutcome::Selective(adopt)) => (
+                pearlite_engine::ReconcileDecisions::Selective { adopt },
+                "interactive",
+            ),
+            Err(io_err) => {
+                return Envelope::failure(
+                    metadata_at(None),
+                    ErrorPayload {
+                        code: "RECONCILE_PROMPT_IO_FAILED".to_owned(),
+                        class: "preflight".to_owned(),
+                        exit_code: 2,
+                        message: format!("reading reconcile prompt input failed: {io_err}"),
+                        hint: "pearlite reconcile --commit --adopt-all".to_owned(),
+                        details: serde_json::Value::Null,
+                    },
+                );
+            }
+        }
+    };
+
+    match ctx
+        .engine
+        .reconcile_commit(&ctx.state_path, &decisions, threshold)
+    {
         Ok(outcome) => Envelope::success(
-            metadata_at(Some(outcome.hostname.clone())),
-            reconcile_outcome_view(&outcome),
+            metadata_at(None),
+            reconcile_commit_outcome_view(&outcome, action_label),
         ),
-        Err(e) => Envelope::failure(metadata_at(None), reconcile_error_payload(&e)),
+        Err(e) => Envelope::failure(metadata_at(None), reconcile_commit_error_payload(&e)),
     }
 }
 
@@ -456,6 +630,173 @@ fn reconcile_outcome_view(outcome: &pearlite_engine::ReconcileOutcome) -> serde_
         "imported_path": outcome.path.to_string_lossy(),
         "hostname": outcome.hostname,
     })
+}
+
+/// Render-friendly view of [`pearlite_engine::ReconcileCommitOutcome`].
+fn reconcile_commit_outcome_view(
+    outcome: &pearlite_engine::ReconcileCommitOutcome,
+    action_label: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "committed": true,
+        "aborted": false,
+        "plan_id": outcome.plan_id,
+        "committed_at": outcome.committed_at.to_string(),
+        "action": action_label,
+        "considered": outcome.considered,
+        "adopted": outcome.adopted,
+        "skipped": outcome.skipped,
+    })
+}
+
+/// Probe the live system and return the merged Manual drift names
+/// (pacman + cargo, sorted) by delegating to
+/// [`Engine::probe_manual_drift`].
+///
+/// Probe and state-read failures from the engine are mapped to typed
+/// payloads the caller can hand straight to `Envelope::failure`.
+fn probe_manual_drift(ctx: &RunContext) -> Result<Vec<String>, ErrorPayload> {
+    ctx.engine
+        .probe_manual_drift(&ctx.state_path)
+        .map_err(|e| reconcile_commit_error_payload(&e))
+}
+
+/// Build the `RECONCILE_THRESHOLD_EXCEEDED` payload. Message wording
+/// is mandated by ADR-0014 §2: name the count, name the threshold,
+/// surface the fresh-install case explicitly, and point at
+/// `--adopt-all` for bulk adoption.
+fn threshold_exceeded_payload(count: u32, threshold: u32) -> ErrorPayload {
+    ErrorPayload {
+        code: "RECONCILE_THRESHOLD_EXCEEDED".to_owned(),
+        class: "preflight".to_owned(),
+        exit_code: 2,
+        message: format!(
+            "{count} Manual drift items would be adopted; threshold is {threshold} \
+             (ADR-0014). On a brand-new host every explicitly-installed package classifies \
+             as Manual, so the threshold always trips on the first reconcile — pass \
+             `--adopt-all` for fresh-install bulk adoption, or `--commit-threshold N` \
+             after auditing real drift."
+        ),
+        hint: "pearlite reconcile --commit --adopt-all".to_owned(),
+        details: serde_json::json!({
+            "manual_count": count,
+            "commit_threshold": threshold,
+        }),
+    }
+}
+
+/// Map [`pearlite_engine::ReconcileCommitError`] to a typed payload.
+fn reconcile_commit_error_payload(err: &pearlite_engine::ReconcileCommitError) -> ErrorPayload {
+    use pearlite_engine::ReconcileCommitError as R;
+    match err {
+        R::Probe(e) => ErrorPayload {
+            code: "RECONCILE_PROBE_FAILED".to_owned(),
+            class: "preflight".to_owned(),
+            exit_code: 2,
+            message: format!("probing live system failed: {e}"),
+            hint: "run `pearlite plan` first to surface the underlying probe error".to_owned(),
+            details: serde_json::Value::Null,
+        },
+        R::State(e) => ErrorPayload {
+            code: "STATE_READ_FAILED".to_owned(),
+            class: "preflight".to_owned(),
+            exit_code: 2,
+            message: format!("state.toml read or write failed: {e}"),
+            hint: "verify state.toml is readable and writable; recover from snapper if corrupt"
+                .to_owned(),
+            details: serde_json::Value::Null,
+        },
+        R::ThresholdExceeded { count, threshold } => threshold_exceeded_payload(*count, *threshold),
+    }
+}
+
+/// Outcome of the per-package adoption prompt loop.
+#[derive(Debug, PartialEq, Eq)]
+enum PromptOutcome {
+    /// Operator chose to adopt the names in the set; everything else
+    /// in the prompted Manual list is skipped.
+    Selective(BTreeSet<String>),
+    /// Operator hit `q`; abort the commit without writing `state.toml`.
+    Quit,
+}
+
+/// Per-package prompt loop for `pearlite reconcile --commit` interactive
+/// mode (ADR-0014 §4).
+///
+/// For each name in `manual`, prompts with the menu
+/// `[y]es / [N]o (default) / [a]dopt-all / [s]kip-all / [q]uit`. The
+/// active mode (per-prompt, bulk-accept after `a`, bulk-skip after `s`)
+/// is carried as local state. `q` short-circuits to
+/// [`PromptOutcome::Quit`].
+///
+/// Empty `manual` returns `Selective(empty)` immediately without
+/// prompting.
+fn run_prompt_loop<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    manual: &[String],
+) -> std::io::Result<PromptOutcome> {
+    enum Mode {
+        Prompt,
+        BulkAdopt,
+        BulkSkip,
+    }
+
+    if manual.is_empty() {
+        return Ok(PromptOutcome::Selective(BTreeSet::new()));
+    }
+
+    writeln!(
+        output,
+        "{} Manual drift item(s) to review. Per item: \
+         [y]es / [N]o (default) / [a]dopt-all / [s]kip-all / [q]uit.",
+        manual.len()
+    )?;
+
+    let mut mode = Mode::Prompt;
+    let mut adopt = BTreeSet::new();
+    let mut buf = String::new();
+
+    for name in manual {
+        match mode {
+            Mode::BulkAdopt => {
+                adopt.insert(name.clone());
+                continue;
+            }
+            Mode::BulkSkip => continue,
+            Mode::Prompt => {}
+        }
+
+        write!(output, "  adopt {name}? [y/N/a/s/q] ")?;
+        output.flush()?;
+        buf.clear();
+        let read = input.read_line(&mut buf)?;
+        let trimmed = buf.trim();
+
+        // EOF mid-loop is treated as quit — safer than silently
+        // skip-defaulting whatever's left.
+        if read == 0 {
+            return Ok(PromptOutcome::Quit);
+        }
+
+        match trimmed {
+            "y" | "Y" => {
+                adopt.insert(name.clone());
+            }
+            "a" | "A" => {
+                adopt.insert(name.clone());
+                mode = Mode::BulkAdopt;
+            }
+            "s" | "S" => {
+                mode = Mode::BulkSkip;
+            }
+            "q" | "Q" => return Ok(PromptOutcome::Quit),
+            // "n" / "N" / empty (bare-Enter) / anything else → skip.
+            _ => {}
+        }
+    }
+
+    Ok(PromptOutcome::Selective(adopt))
 }
 
 /// Map `ReconcileError` to a typed [`ErrorPayload`].
@@ -803,7 +1144,13 @@ fn label_for(command: &Command) -> String {
         },
         Command::Schema { .. } => "pearlite schema".to_owned(),
         Command::Bootstrap { .. } => "pearlite bootstrap".to_owned(),
-        Command::Reconcile => "pearlite reconcile".to_owned(),
+        Command::Reconcile { commit, .. } => {
+            if *commit {
+                "pearlite reconcile --commit".to_owned()
+            } else {
+                "pearlite reconcile".to_owned()
+            }
+        }
     }
 }
 
@@ -1398,7 +1745,7 @@ package = "linux-cachyos"
         let data = env.data.expect("data");
         let schema = data
             .get("$schema")
-            .and_then(|v| v.as_str())
+            .and_then(serde_json::Value::as_str)
             .expect("$schema");
         assert!(schema.contains("2020-12"));
     }
@@ -1920,7 +2267,7 @@ package = "linux-cachyos"
         );
         let gens = data
             .get("generations")
-            .and_then(|v| v.as_array())
+            .and_then(serde_json::Value::as_array)
             .expect("generations array");
         assert!(gens.is_empty());
     }
@@ -1945,7 +2292,7 @@ package = "linux-cachyos"
         );
         let gens = data
             .get("generations")
-            .and_then(|v| v.as_array())
+            .and_then(serde_json::Value::as_array)
             .expect("generations array");
         assert_eq!(gens.len(), 1);
         assert_eq!(
@@ -2442,7 +2789,29 @@ expected_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
             format: OutputFormat::Json,
             config_dir,
             state_file,
-            command: Command::Reconcile,
+            command: Command::Reconcile {
+                commit: false,
+                adopt_all: false,
+                commit_threshold: None,
+            },
+        }
+    }
+
+    fn args_for_reconcile_commit(
+        config_dir: PathBuf,
+        state_file: PathBuf,
+        adopt_all: bool,
+        commit_threshold: Option<u32>,
+    ) -> Args {
+        Args {
+            format: OutputFormat::Json,
+            config_dir,
+            state_file,
+            command: Command::Reconcile {
+                commit: true,
+                adopt_all,
+                commit_threshold,
+            },
         }
     }
 
@@ -2518,5 +2887,443 @@ expected_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
         let args = args_for_reconcile(config_dir, state_path);
         let env = dispatch(&args, &ctx);
         assert_eq!(env.metadata.command, "pearlite reconcile");
+    }
+
+    // ----------------------------------------------------------------
+    // reconcile --commit (ADR-0014)
+    // ----------------------------------------------------------------
+
+    /// `ctx_with` always uses an empty probed inventory. For commit
+    /// tests we want to seed Manual drift, so build a context with a
+    /// caller-supplied `ProbedState`.
+    fn ctx_with_probed(
+        host_path: PathBuf,
+        host_body: &str,
+        state_path: PathBuf,
+        probed: ProbedState,
+    ) -> RunContext {
+        let mut nickel = MockNickel::new();
+        nickel.seed(host_path, host_body);
+        let probe = Box::new(MockProbe::with_state(probed));
+        let engine = Engine::new(Box::new(nickel), probe, PathBuf::from("/cfg-repo"));
+        RunContext {
+            engine,
+            state_path,
+            fallback_host: "forge".to_owned(),
+            pacman: Box::new(MockPacman::new()),
+            cargo: Box::new(MockCargo::new()),
+            systemd: Box::new(MockSystemd::new()),
+            snapper: Box::new(MockSnapper::new()),
+            home_manager: Box::new(MockHmBackend::new()),
+            nix_installer: Box::new(MockNixInstaller::new()),
+        }
+    }
+
+    fn probed_with_pacman(names: &[&str]) -> ProbedState {
+        let mut p = empty_probed();
+        p.pacman = Some(PacmanInventory {
+            explicit: names.iter().map(|s| (*s).to_owned()).collect(),
+            ..Default::default()
+        });
+        p
+    }
+
+    // ---- Prompt loop ----
+
+    use std::io::Cursor;
+
+    fn run_prompt_with(input: &str, manual: &[&str]) -> (PromptOutcome, String) {
+        let mut cursor = Cursor::new(input.as_bytes().to_vec());
+        let mut out = Vec::new();
+        let names: Vec<String> = manual.iter().map(|s| (*s).to_owned()).collect();
+        let outcome = run_prompt_loop(&mut cursor, &mut out, &names).expect("prompt");
+        (outcome, String::from_utf8(out).expect("utf8"))
+    }
+
+    #[test]
+    fn prompt_loop_empty_manual_returns_empty_selection_without_prompting() {
+        let (outcome, out) = run_prompt_with("", &[]);
+        assert_eq!(outcome, PromptOutcome::Selective(BTreeSet::new()));
+        assert!(out.is_empty(), "empty manual list must not print anything");
+    }
+
+    #[test]
+    fn prompt_loop_default_skip_on_bare_enter() {
+        let (outcome, _) = run_prompt_with("\n\n", &["htop", "vim"]);
+        assert_eq!(outcome, PromptOutcome::Selective(BTreeSet::new()));
+    }
+
+    #[test]
+    fn prompt_loop_y_adopts_n_skips() {
+        let (outcome, _) = run_prompt_with("y\nn\ny\n", &["htop", "vim", "nano"]);
+        let mut want = BTreeSet::new();
+        want.insert("htop".to_owned());
+        want.insert("nano".to_owned());
+        assert_eq!(outcome, PromptOutcome::Selective(want));
+    }
+
+    #[test]
+    fn prompt_loop_a_switches_to_bulk_adopt() {
+        // First prompted "htop" answered 'a' → adopt htop and bulk-accept rest.
+        let (outcome, out) = run_prompt_with("a\n", &["htop", "vim", "nano"]);
+        let mut want = BTreeSet::new();
+        want.insert("htop".to_owned());
+        want.insert("vim".to_owned());
+        want.insert("nano".to_owned());
+        assert_eq!(outcome, PromptOutcome::Selective(want));
+        // Bulk path must not re-prompt for vim/nano.
+        assert_eq!(out.matches("adopt vim?").count(), 0);
+        assert_eq!(out.matches("adopt nano?").count(), 0);
+    }
+
+    #[test]
+    fn prompt_loop_s_switches_to_bulk_skip() {
+        // 'y' for htop, then 's' for vim → skip vim and nano.
+        let (outcome, _) = run_prompt_with("y\ns\n", &["htop", "vim", "nano"]);
+        let mut want = BTreeSet::new();
+        want.insert("htop".to_owned());
+        assert_eq!(outcome, PromptOutcome::Selective(want));
+    }
+
+    #[test]
+    fn prompt_loop_q_quits_immediately() {
+        let (outcome, _) = run_prompt_with("q\n", &["htop", "vim"]);
+        assert_eq!(outcome, PromptOutcome::Quit);
+    }
+
+    #[test]
+    fn prompt_loop_eof_mid_loop_treated_as_quit() {
+        // No newline → read_line returns 0 bytes → Quit (safer than
+        // silently defaulting whatever's left to skip).
+        let (outcome, _) = run_prompt_with("", &["htop"]);
+        assert_eq!(outcome, PromptOutcome::Quit);
+    }
+
+    // ---- Dispatch arms ----
+
+    #[test]
+    fn reconcile_commit_non_interactive_without_adopt_all_refuses() {
+        let dir = TempDir::new().expect("tempdir");
+        let config_dir = dir.path().join("repo");
+        let state_path = dir.path().join("state.toml");
+        write_baseline_state(&state_path);
+        let host = config_dir.join("hosts").join("forge.ncl");
+
+        let ctx = ctx_with_probed(
+            host,
+            MINIMAL_HOST,
+            state_path.clone(),
+            probed_with_pacman(&["htop"]),
+        );
+        let opts = ReconcileOpts {
+            commit: true,
+            adopt_all: false,
+            commit_threshold: None,
+        };
+        let metadata_at = |host: Option<String>| Metadata {
+            command: "pearlite reconcile --commit".to_owned(),
+            host,
+            tool_version: "test".to_owned(),
+            completed_at: "2026-05-07T00:00:00Z".to_owned(),
+            duration_ms: 0,
+            config_dir: Some(config_dir.clone()),
+            invoking_agent: None,
+        };
+        let mut input = Cursor::new(Vec::new());
+        let mut output = Vec::new();
+        let env = dispatch_reconcile_commit(
+            &ctx,
+            &opts,
+            true, // non_interactive
+            &mut input,
+            &mut output,
+            &metadata_at,
+        );
+
+        let err = env.error.expect("must refuse");
+        assert_eq!(err.code, "RECONCILE_REQUIRES_INTERACTIVE");
+        assert_eq!(err.class, "preflight");
+        assert_eq!(err.exit_code, 2);
+        assert_eq!(err.hint, "pearlite reconcile --commit --adopt-all");
+
+        // state.toml must not have grown a [[reconciliations]] entry.
+        let state_after = StateStore::new(state_path).read().expect("read");
+        assert!(state_after.reconciliations.is_empty());
+    }
+
+    #[test]
+    fn reconcile_commit_adopt_all_writes_state_and_returns_success_envelope() {
+        let dir = TempDir::new().expect("tempdir");
+        let config_dir = dir.path().join("repo");
+        let state_path = dir.path().join("state.toml");
+        write_baseline_state(&state_path);
+        let host = config_dir.join("hosts").join("forge.ncl");
+
+        let ctx = ctx_with_probed(
+            host,
+            MINIMAL_HOST,
+            state_path.clone(),
+            probed_with_pacman(&["htop", "vim"]),
+        );
+        let args = args_for_reconcile_commit(config_dir, state_path.clone(), true, None);
+        let env = dispatch(&args, &ctx);
+
+        assert!(env.error.is_none(), "got error {:?}", env.error);
+        let data = env.data.expect("data");
+        assert_eq!(
+            data.get("committed").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            data.get("aborted").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            data.get("action").and_then(serde_json::Value::as_str),
+            Some("adopt_all")
+        );
+        assert_eq!(
+            data.get("considered").and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        let adopted = data
+            .get("adopted")
+            .and_then(serde_json::Value::as_array)
+            .expect("adopted");
+        assert_eq!(adopted.len(), 2);
+
+        let state_after = StateStore::new(state_path).read().expect("read");
+        assert_eq!(
+            state_after.adopted.pacman,
+            vec!["htop".to_owned(), "vim".to_owned()]
+        );
+        assert_eq!(state_after.reconciliations.len(), 1);
+    }
+
+    #[test]
+    fn reconcile_commit_threshold_exceeded_returns_typed_error_without_writing() {
+        let dir = TempDir::new().expect("tempdir");
+        let config_dir = dir.path().join("repo");
+        let state_path = dir.path().join("state.toml");
+        write_baseline_state(&state_path);
+        let host = config_dir.join("hosts").join("forge.ncl");
+
+        // 6 Manual items, default threshold of 5.
+        let ctx = ctx_with_probed(
+            host,
+            MINIMAL_HOST,
+            state_path.clone(),
+            probed_with_pacman(&["a", "b", "c", "d", "e", "f"]),
+        );
+        let args = args_for_reconcile_commit(config_dir, state_path.clone(), false, None);
+
+        // Force interactive mode by feeding a TTY-equivalent input
+        // (the dispatch path consults stdin-is_terminal at runtime;
+        // we use the dispatch_reconcile_commit override to assert the
+        // CLI-side threshold gate fires before any prompt.)
+        let opts = ReconcileOpts {
+            commit: true,
+            adopt_all: false,
+            commit_threshold: None,
+        };
+        let metadata_at = |host: Option<String>| Metadata {
+            command: "pearlite reconcile --commit".to_owned(),
+            host,
+            tool_version: "test".to_owned(),
+            completed_at: "2026-05-07T00:00:00Z".to_owned(),
+            duration_ms: 0,
+            config_dir: None,
+            invoking_agent: None,
+        };
+        let mut input = Cursor::new(Vec::new());
+        let mut output = Vec::new();
+        let env =
+            dispatch_reconcile_commit(&ctx, &opts, false, &mut input, &mut output, &metadata_at);
+
+        let err = env.error.expect("must refuse");
+        assert_eq!(err.code, "RECONCILE_THRESHOLD_EXCEEDED");
+        assert_eq!(err.class, "preflight");
+        assert_eq!(err.exit_code, 2);
+        assert!(
+            err.message.contains('6') && err.message.contains('5'),
+            "message must name count and threshold: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("--adopt-all"),
+            "message must point at --adopt-all for the fresh-install case: {}",
+            err.message
+        );
+        assert_eq!(err.hint, "pearlite reconcile --commit --adopt-all");
+
+        let state_after = StateStore::new(state_path).read().expect("read");
+        assert!(state_after.reconciliations.is_empty());
+        // Suppress unused-write warning for `args` — it documents the
+        // public surface even though this test bypasses dispatch().
+        let _ = args;
+    }
+
+    #[test]
+    fn reconcile_commit_at_threshold_boundary_adopts_via_prompt_loop() {
+        let dir = TempDir::new().expect("tempdir");
+        let config_dir = dir.path().join("repo");
+        let state_path = dir.path().join("state.toml");
+        write_baseline_state(&state_path);
+        let host = config_dir.join("hosts").join("forge.ncl");
+
+        // Exactly 5 Manual items, default threshold = 5 → allowed.
+        // Operator answers "a" to bulk-adopt.
+        let ctx = ctx_with_probed(
+            host,
+            MINIMAL_HOST,
+            state_path.clone(),
+            probed_with_pacman(&["a", "b", "c", "d", "e"]),
+        );
+        let opts = ReconcileOpts {
+            commit: true,
+            adopt_all: false,
+            commit_threshold: None,
+        };
+        let metadata_at = |host: Option<String>| Metadata {
+            command: "pearlite reconcile --commit".to_owned(),
+            host,
+            tool_version: "test".to_owned(),
+            completed_at: "2026-05-07T00:00:00Z".to_owned(),
+            duration_ms: 0,
+            config_dir: None,
+            invoking_agent: None,
+        };
+        let mut input = Cursor::new(b"a\n".to_vec());
+        let mut output = Vec::new();
+        let env =
+            dispatch_reconcile_commit(&ctx, &opts, false, &mut input, &mut output, &metadata_at);
+
+        assert!(env.error.is_none(), "got error {:?}", env.error);
+        let data = env.data.expect("data");
+        assert_eq!(
+            data.get("action").and_then(serde_json::Value::as_str),
+            Some("interactive")
+        );
+        assert_eq!(
+            data.get("considered").and_then(serde_json::Value::as_u64),
+            Some(5)
+        );
+        let adopted = data
+            .get("adopted")
+            .and_then(serde_json::Value::as_array)
+            .expect("adopted");
+        assert_eq!(adopted.len(), 5);
+    }
+
+    #[test]
+    fn reconcile_commit_q_aborts_without_writing() {
+        let dir = TempDir::new().expect("tempdir");
+        let config_dir = dir.path().join("repo");
+        let state_path = dir.path().join("state.toml");
+        write_baseline_state(&state_path);
+        let host = config_dir.join("hosts").join("forge.ncl");
+        let original_state = std::fs::read_to_string(&state_path).expect("read original");
+
+        let ctx = ctx_with_probed(
+            host,
+            MINIMAL_HOST,
+            state_path.clone(),
+            probed_with_pacman(&["htop", "vim"]),
+        );
+        let opts = ReconcileOpts {
+            commit: true,
+            adopt_all: false,
+            commit_threshold: None,
+        };
+        let metadata_at = |host: Option<String>| Metadata {
+            command: "pearlite reconcile --commit".to_owned(),
+            host,
+            tool_version: "test".to_owned(),
+            completed_at: "2026-05-07T00:00:00Z".to_owned(),
+            duration_ms: 0,
+            config_dir: None,
+            invoking_agent: None,
+        };
+        let mut input = Cursor::new(b"q\n".to_vec());
+        let mut output = Vec::new();
+        let env =
+            dispatch_reconcile_commit(&ctx, &opts, false, &mut input, &mut output, &metadata_at);
+
+        assert!(env.error.is_none(), "got error {:?}", env.error);
+        let data = env.data.expect("data");
+        assert_eq!(
+            data.get("committed").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            data.get("aborted").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        // state.toml byte-identical: no [[reconciliations]] write.
+        let after = std::fs::read_to_string(&state_path).expect("read after");
+        assert_eq!(after, original_state);
+    }
+
+    #[test]
+    fn reconcile_commit_label_reflects_commit_flag() {
+        let dir = TempDir::new().expect("tempdir");
+        let config_dir = dir.path().join("repo");
+        let state_path = dir.path().join("state.toml");
+        write_baseline_state(&state_path);
+        let host = config_dir.join("hosts").join("forge.ncl");
+
+        let ctx = ctx_with_probed(
+            host,
+            MINIMAL_HOST,
+            state_path.clone(),
+            probed_with_pacman(&["htop"]),
+        );
+        let args = args_for_reconcile_commit(config_dir, state_path, true, None);
+        let env = dispatch(&args, &ctx);
+        assert_eq!(env.metadata.command, "pearlite reconcile --commit");
+    }
+
+    #[test]
+    fn reconcile_commit_adopt_all_with_threshold_exceeded_maps_engine_error() {
+        let dir = TempDir::new().expect("tempdir");
+        let config_dir = dir.path().join("repo");
+        let state_path = dir.path().join("state.toml");
+        write_baseline_state(&state_path);
+        let host = config_dir.join("hosts").join("forge.ncl");
+
+        // 4 Manual items, --adopt-all --commit-threshold 3 → engine
+        // refuses, CLI maps to RECONCILE_THRESHOLD_EXCEEDED.
+        let ctx = ctx_with_probed(
+            host,
+            MINIMAL_HOST,
+            state_path.clone(),
+            probed_with_pacman(&["a", "b", "c", "d"]),
+        );
+        let args = args_for_reconcile_commit(config_dir, state_path.clone(), true, Some(3));
+        let env = dispatch(&args, &ctx);
+
+        let err = env.error.expect("must refuse");
+        assert_eq!(err.code, "RECONCILE_THRESHOLD_EXCEEDED");
+        assert_eq!(err.exit_code, 2);
+        let after = StateStore::new(state_path).read().expect("read");
+        assert!(after.reconciliations.is_empty());
+    }
+
+    #[test]
+    fn reconcile_opts_effective_threshold_matches_adr_table() {
+        let make = |adopt_all, t| ReconcileOpts {
+            commit: true,
+            adopt_all,
+            commit_threshold: t,
+        };
+        // bare --commit → default 5
+        assert_eq!(make(false, None).effective_threshold(), Some(5));
+        // --commit --commit-threshold 12 → Some(12)
+        assert_eq!(make(false, Some(12)).effective_threshold(), Some(12));
+        // bare --adopt-all → unbounded
+        assert_eq!(make(true, None).effective_threshold(), None);
+        // --adopt-all --commit-threshold 50 → Some(50)
+        assert_eq!(make(true, Some(50)).effective_threshold(), Some(50));
     }
 }
